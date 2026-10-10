@@ -1,0 +1,85 @@
+//! Command-line tools, handy for scripting and headless checks.
+
+use std::path::{Path, PathBuf};
+
+use ac_core::{acd, content, install, paths};
+
+const USAGE: &str = "\
+usage: cm-rs [command]
+
+With no command, opens the GUI.
+
+  acd unpack <data.acd> [out_dir]   decrypt data.acd (default: <car>/data)
+  acd pack <data_dir> [data.acd]    encrypt a data folder (default: <car>/data.acd)
+  list cars|tracks [ac_root]        list installed content
+  install <mod.zip> [ac_root]       install cars/tracks from a zip
+  where                             show detected paths";
+
+fn root(arg: Option<&&str>) -> anyhow::Result<PathBuf> {
+    arg.map(PathBuf::from)
+        .or_else(|| ac_core::settings::Settings::load().ac_root)
+        .or_else(paths::find_ac_root)
+        .ok_or_else(|| anyhow::anyhow!("Assetto Corsa not found; pass its folder"))
+}
+
+pub fn run(args: &[String]) -> i32 {
+    match run_inner(args) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            1
+        }
+    }
+}
+
+fn run_inner(args: &[String]) -> anyhow::Result<()> {
+    let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    match a.as_slice() {
+        ["acd", "unpack", file, rest @ ..] => {
+            let file = Path::new(file);
+            let out = rest.first().map(PathBuf::from).unwrap_or_else(|| file.with_file_name("data"));
+            let n = acd::unpack(file, &out)?;
+            println!("unpacked {n} files to {}", out.display());
+        }
+        ["acd", "pack", dir, rest @ ..] => {
+            let dir = Path::new(dir);
+            let out = rest.first().map(PathBuf::from).unwrap_or_else(|| dir.with_file_name("data.acd"));
+            let n = acd::pack(dir, &out)?;
+            println!("packed {n} files into {}", out.display());
+        }
+        ["list", "cars", rest @ ..] => {
+            for c in content::scan_cars(&root(rest.first())?) {
+                println!("{:<40} {}", c.id, c.name);
+            }
+        }
+        ["list", "tracks", rest @ ..] => {
+            let r = root(rest.first())?;
+            for t in content::track_entries(&content::scan_tracks(&r)) {
+                println!("{:<40} {}", t.key(), t.layout.name);
+            }
+        }
+        ["install", zip, rest @ ..] => {
+            let r = root(rest.first())?;
+            let zip = Path::new(zip);
+            let items = install::plan_zip(zip, &r)?;
+            for i in &items {
+                println!("{:?} {} -> {}{}", i.kind, i.id, i.target.display(), if i.exists { " (update)" } else { "" });
+            }
+            let n = install::install_zip(zip, &items)?;
+            println!("wrote {n} files");
+        }
+        ["where"] => {
+            println!("steam roots: {:?}", paths::steam_roots());
+            println!("libraries:   {:?}", paths::steam_libraries());
+            let r = paths::find_ac_root();
+            println!("ac root:     {r:?}");
+            if let Some(r) = r {
+                println!("race.ini:    {:?}", paths::race_ini_path(&r));
+                println!("compatdata:  {:?}", paths::compat_data_dir(&r));
+                println!("proton:      {:?}", ac_core::launch::find_proton(&r));
+            }
+        }
+        _ => println!("{USAGE}"),
+    }
+    Ok(())
+}

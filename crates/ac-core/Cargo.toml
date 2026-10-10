@@ -1,0 +1,16 @@
+[package]
+name = "ac-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Assetto Corsa content, data.acd, race.ini and launch support"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+zip.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"

@@ -1,0 +1,16 @@
+[package]
+name = "cm-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Content Manager for Assetto Corsa, rewritten in Rust with GPUI"
+
+[[bin]]
+name = "cm-rs"
+path = "src/main.rs"
+
+[dependencies]
+ac-core = { path = "../ac-core" }
+anyhow.workspace = true
+gpui.workspace = true
+unicode-segmentation.workspace = true
