@@ -64,31 +64,67 @@ fn detect(names: &[String], archive_stem: &str) -> BTreeSet<(Kind, String, Strin
             _ => None,
         };
         if let Some((kind, prefix)) = root {
-            let id = if prefix.is_empty() { archive_stem } else { last(prefix) };
+            let id = if prefix.is_empty() {
+                archive_stem
+            } else {
+                last(prefix)
+            };
             roots.insert((kind, id.to_owned(), prefix.to_owned()));
         }
     }
     // A car root inside a track root (or vice versa) is noise; keep outermost.
     let all: Vec<_> = roots.iter().cloned().collect();
     roots.retain(|(_, _, p)| {
-        !all.iter().any(|(_, _, other)| other != p && !other.is_empty() && p.starts_with(&format!("{other}/")))
+        !all.iter().any(|(_, _, other)| {
+            other != p && !other.is_empty() && p.starts_with(&format!("{other}/"))
+        })
     });
     roots
+}
+
+fn archive_name(name: &str) -> Result<String> {
+    let name = name.replace('\\', "/");
+    if std::path::Path::new(&name).components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        bail!("unsafe archive path: {name}");
+    }
+    Ok(name)
 }
 
 pub fn plan_zip(archive: &Path, ac_root: &Path) -> Result<Vec<Item>> {
     let mut zip = zip::ZipArchive::new(File::open(archive)?).context("not a zip archive")?;
     let names: Vec<String> = (0..zip.len())
-        .filter_map(|i| zip.by_index(i).ok().map(|f| f.name().replace('\\', "/")))
-        .collect();
-    let stem = archive.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        .map(|i| archive_name(zip.by_index(i)?.name()))
+        .collect::<Result<Vec<_>>>()?;
+    let stem = archive
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let items: Vec<Item> = detect(&names, &stem)
         .into_iter()
         .map(|(kind, id, prefix)| {
+            let mut components = Path::new(&id).components();
+            if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+                || components.next().is_some()
+            {
+                bail!("unsafe content identifier: {id}");
+            }
             let target = ac_root.join("content").join(kind.folder()).join(&id);
-            Item { exists: target.exists(), kind, id, prefix, target }
+            Ok(Item {
+                exists: target.exists(),
+                kind,
+                id,
+                prefix,
+                target,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     if items.is_empty() {
         bail!("no cars or tracks found in {}", archive.display());
     }
@@ -101,16 +137,32 @@ pub fn install_zip(archive: &Path, items: &[Item]) -> Result<usize> {
     let mut written = 0;
     for i in 0..zip.len() {
         let mut f = zip.by_index(i)?;
-        let Some(enclosed) = f.enclosed_name() else { continue };
-        let name = enclosed.to_string_lossy().replace('\\', "/");
+        let name = archive_name(f.name())?;
         for item in items {
             let rel = if item.prefix.is_empty() {
                 Some(name.as_str())
             } else {
-                name.strip_prefix(&item.prefix).and_then(|r| r.strip_prefix('/'))
+                name.strip_prefix(&item.prefix)
+                    .and_then(|r| r.strip_prefix('/'))
             };
-            let Some(rel) = rel.filter(|r| !r.is_empty()) else { continue };
+            let Some(rel) = rel.filter(|r| !r.is_empty()) else {
+                continue;
+            };
             let out = item.target.join(rel);
+            let mut checked = item.target.clone();
+            for component in std::iter::once(None).chain(Path::new(rel).components().map(Some)) {
+                if let Some(component) = component {
+                    checked.push(component);
+                }
+                if fs::symlink_metadata(&checked)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    bail!(
+                        "refusing to overwrite symlink destination: {}",
+                        checked.display()
+                    );
+                }
+            }
             if f.is_dir() {
                 fs::create_dir_all(&out)?;
             } else {

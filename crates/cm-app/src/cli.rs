@@ -16,10 +16,11 @@ With no command, opens the GUI.
   where                             show detected paths";
 
 fn root(arg: Option<&&str>) -> anyhow::Result<PathBuf> {
-    arg.map(PathBuf::from)
-        .or_else(|| ac_core::settings::Settings::load().ac_root)
-        .or_else(paths::find_ac_root)
-        .ok_or_else(|| anyhow::anyhow!("Assetto Corsa not found; pass its folder"))
+    let configured = match arg {
+        Some(arg) => Some(PathBuf::from(arg)),
+        None => ac_core::settings::Settings::load()?.ac_root,
+    };
+    configured.or_else(paths::find_ac_root).ok_or_else(|| anyhow::anyhow!("Assetto Corsa not found; pass its folder"))
 }
 
 pub fn run(args: &[String]) -> i32 {
@@ -77,6 +78,8 @@ fn run_inner(args: &[String]) -> anyhow::Result<()> {
                 println!("race.ini:    {:?}", paths::race_ini_path(&r));
                 println!("compatdata:  {:?}", paths::compat_data_dir(&r));
                 println!("proton:      {:?}", ac_core::launch::find_proton(&r));
+                println!("steam-run:   {:?}", ac_core::launch::find_steam_run());
+                println!("settings:    {:?}", ac_core::settings::path());
             }
         }
         _ => println!("{USAGE}"),

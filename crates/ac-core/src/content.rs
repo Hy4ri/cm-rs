@@ -116,6 +116,44 @@ pub struct Weather {
     pub name: String,
 }
 
+/// Case-insensitive order that compares digit runs as numbers, so
+/// "Drag 200m" sorts before "Drag 1000m".
+pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (a.peek().copied(), b.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let take = |it: &mut std::iter::Peekable<std::str::Chars>| {
+                    let mut s = String::new();
+                    while let Some(c) = it.peek().copied().filter(char::is_ascii_digit) {
+                        s.push(c);
+                        it.next();
+                    }
+                    s
+                };
+                let (na, nb) = (take(&mut a), take(&mut b));
+                let (ta, tb) = (na.trim_start_matches('0'), nb.trim_start_matches('0'));
+                let ord = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb));
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            (Some(x), Some(y)) => {
+                let ord = x.to_lowercase().cmp(y.to_lowercase());
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+                a.next();
+                b.next();
+            }
+        }
+    }
+}
+
 fn existing(p: PathBuf) -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
@@ -232,7 +270,7 @@ pub fn scan_cars(ac_root: &Path) -> Vec<Car> {
         .map(|d| load_car(d))
         .filter(|c| c.has_data_acd || c.has_data_dir)
         .collect();
-    cars.sort_by_key(|c| c.name.to_lowercase());
+    cars.sort_by(|a, b| natural_cmp(&a.name, &b.name));
     cars
 }
 
@@ -296,7 +334,7 @@ pub fn track_entries(tracks: &[Track]) -> Vec<TrackEntry> {
             t.layouts.iter().map(|l| TrackEntry { track_id: t.id.clone(), layout: l.clone() })
         })
         .collect();
-    v.sort_by_key(|e| e.layout.name.to_lowercase());
+    v.sort_by(|a, b| natural_cmp(&a.layout.name, &b.layout.name));
     v
 }
 
@@ -361,5 +399,12 @@ mod tests {
     fn weather_names() {
         assert_eq!(pretty_weather_name("4_mid_clear"), "Mid Clear");
         assert_eq!(plain_text("a<br/>\n\tb <i>c</i>"), "a\n\nb c");
+    }
+
+    #[test]
+    fn natural_order() {
+        let mut v = vec!["Drag 1000m", "Drag 200m", "drag 2000m", "Drag 400m", "Drag 0500m", "Barcelona"];
+        v.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(v, ["Barcelona", "Drag 200m", "Drag 400m", "Drag 0500m", "Drag 1000m", "drag 2000m"]);
     }
 }

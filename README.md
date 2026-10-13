@@ -13,6 +13,9 @@ Windows. On Linux it launches the game through Proton.
 - **Cars**: list and search, previews, specs, tags, description, skins; unpack
   `data.acd` → `data/` and pack `data/` → `data.acd` (the old file is backed up).
 - **Tracks**: every layout with preview, outline, length, pit boxes.
+- **Get mods**: browse websites inside the app with CEF/Chromium, including
+  persistent browser sessions, navigation controls and native downloads. Completed
+  downloads offer **Preview**; installation always requires your click.
 - **Install mods**: drop in a `.zip`; cars and tracks are detected anywhere in the
   archive and extracted to `content/`.
 - **Settings**: game folder (auto-detected from Steam libraries), driver name,
@@ -46,10 +49,50 @@ championships, 7z/rar archives, setups, controls editor.
 
 Steam must be running when you press **Go**. The app writes `race.ini` into the
 Proton prefix (`.../pfx/drive_c/users/steamuser/Documents/Assetto Corsa/cfg`)
-and runs `proton run acs.exe` with the Steam compat variables set. The Proton
-build is taken from the prefix's `config_info`, falling back to the newest one
-installed; you can override it in Settings. `cm-rs where` prints what was
-detected.
+and runs `proton run acs.exe` with the Steam compat variables set. When
+`steam-run` is available on PATH, the app launches Proton inside that runtime
+and removes the GUI's inherited library overrides. On NixOS, `steam-run` is
+required alongside Steam; bare Proton can hang without creating a game window.
+This is the Steam runtime wrapper, not SteamCMD or `steam -applaunch` (which
+starts Kunos' launcher rather than the prepared Quick Drive session).
+The Proton build is taken from the prefix's `config_info`, which records the
+last used build, not necessarily the current Steam compatibility selection.
+If absent, detection falls back to the alphabetically last installed Proton
+path. You can override it in Settings. `cm-rs where` prints detected paths.
+
+### Embedded mod browser (Linux/NixOS)
+
+The Nix development shell supplies the CEF runtime matching the pinned Rust
+bindings and keeps GPUI's Vulkan loader ahead of browser libraries:
+
+```sh
+nix develop path:. -c cargo run --release -p cm-app
+```
+
+Open **Get mods**, browse to a mod site, then use **Preview** on a completed
+ZIP download and **Install** on the detected-content preview. Cancelled or
+interrupted downloads are not installable. Downloads and the browser profile
+live under the platform/XDG cache directory in `cm-rs/browser/`.
+
+For a custom runtime, set `CM_RS_CEF_PATH` to the flattened CEF resource/library
+directory; `CEF_PATH` is also required at build time. Keep the runtime version
+aligned with `cef` and `cef-dll-sys`. Chromium sandboxing and certificate checks
+remain enabled. Login is performed in the browser; websites receive no direct
+installer API. The existing installer supports ZIP cars/tracks, not 7z/RAR.
+
+The browser has been exercised on native Wayland in NixOS; Windows browser
+integration, complex IME composition and HiDPI remain unverified.
+
+### App configuration
+
+App settings and the last Quick Drive session live in
+`~/.config/cm-rs/settings.toml` (or the platform/XDG config directory).
+Existing `settings.json` is migrated automatically on first load; the original
+JSON is retained unchanged as a backup. TOML takes precedence once present.
+Invalid TOML reports an error rather than silently resetting or overwriting it.
+Writes replace the file atomically. Edit it while the app is closed; saves
+normalize formatting and do not preserve comments. Assetto Corsa's own INI
+files and car/track metadata JSON keep their required game formats.
 
 Flatpak Steam: detection covers `~/.var/app/com.valvesoftware.Steam`, but
 running Proton from outside the Flatpak sandbox may not work. Native Steam is

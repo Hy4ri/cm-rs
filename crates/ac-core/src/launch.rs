@@ -48,24 +48,25 @@ pub fn start(ac_root: &Path, opts: &LaunchOptions) -> Result<Child> {
                 "no Proton found. Set Assetto Corsa to use Proton in Steam and run it once, or pick the proton script in Settings.",
             )?,
         };
-        let compat = paths::compat_data_dir(ac_root).context("no Proton prefix for Assetto Corsa yet; run it from Steam once")?;
+        let compat = paths::compat_data_dir(ac_root)
+            .context("no Proton prefix for Assetto Corsa yet; run it from Steam once")?;
         let steam_root = paths::steam_roots().into_iter().next().context("Steam install not found")?;
-        let mut c = Command::new(proton);
-        c.arg("run")
-            .arg(&acs)
-            .env("STEAM_COMPAT_DATA_PATH", compat)
+        let runtime = find_steam_run();
+        if Path::new("/etc/NIXOS").exists() && runtime.is_none() {
+            bail!("steam-run is required on NixOS; enable/install it alongside Steam");
+        }
+        let mut c = proton_command(&acs, &proton, runtime.as_deref());
+        c.env("STEAM_COMPAT_DATA_PATH", compat)
             .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", steam_root)
             .env("STEAM_COMPAT_APP_ID", &app_id);
         c
     };
-    cmd.current_dir(ac_root)
-        .env("SteamAppId", &app_id)
-        .env("SteamGameId", &app_id);
+    cmd.current_dir(ac_root).env("SteamAppId", &app_id).env("SteamGameId", &app_id);
     cmd.spawn().with_context(|| format!("starting {}", acs.display()))
 }
 
 /// Finds the Proton build Steam last used for AC (from the prefix's
-/// `config_info`), falling back to the newest installed Proton.
+/// `config_info`), falling back to the last installed path alphabetically.
 pub fn find_proton(ac_root: &Path) -> Option<PathBuf> {
     if let Some(compat) = paths::compat_data_dir(ac_root) {
         if let Ok(info) = std::fs::read_to_string(compat.join("config_info")) {
@@ -90,4 +91,46 @@ pub fn find_proton(ac_root: &Path) -> Option<PathBuf> {
     }
     found.sort();
     found.pop()
+}
+
+/// Steam's FHS runtime wrapper, available on NixOS. This is not SteamCMD
+/// (the server downloader), nor `steam -applaunch` (which opens Kunos' launcher).
+pub fn find_steam_run() -> Option<PathBuf> {
+    std::env::var_os("PATH")
+        .and_then(|paths| std::env::split_paths(&paths).map(|p| p.join("steam-run")).find(|p| p.is_file()))
+}
+
+fn proton_command(acs: &Path, proton: &Path, runtime: Option<&Path>) -> Command {
+    let mut cmd = if let Some(runtime) = runtime {
+        let mut c = Command::new(runtime);
+        c.arg(proton);
+        // The app's GPUI library paths are not the game's runtime. Let
+        // steam-run provide its own libraries instead of leaking the Nix shell.
+        c.env_remove("LD_LIBRARY_PATH").env_remove("LD_PRELOAD");
+        c
+    } else {
+        Command::new(proton)
+    };
+    cmd.arg("run").arg(acs);
+    cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_wraps_proton_without_shell_splitting() {
+        let cmd = proton_command(
+            Path::new("/game with spaces/acs.exe"),
+            Path::new("/Proton - Experimental/proton"),
+            Some(Path::new("/bin/steam-run")),
+        );
+        assert_eq!(cmd.get_program(), "/bin/steam-run");
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, ["/Proton - Experimental/proton", "run", "/game with spaces/acs.exe"]);
+        for key in ["LD_LIBRARY_PATH", "LD_PRELOAD"] {
+            assert!(cmd.get_envs().any(|(k, v)| k == key && v.is_none()));
+        }
+    }
 }

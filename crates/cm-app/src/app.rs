@@ -9,13 +9,16 @@ use ac_core::race::{self, Conditions, Mode, QuickDrive};
 use ac_core::settings::Settings;
 use ac_core::{acd, install, launch, paths};
 use gpui::{
-    ClickEvent, Context, Entity, FontWeight, ObjectFit, PathPromptOptions, SharedString, Window,
-    div, img, prelude::*, px, uniform_list,
+    ClickEvent, Context, Div, Entity, FontWeight, ObjectFit, PathPromptOptions, SharedString,
+    Window, div, img, prelude::*, px, uniform_list,
 };
 
+use crate::browser_view::{BrowserView, PreviewDownload};
 use crate::text_input::TextInput;
 use crate::theme;
-use crate::widgets::{button, chip, field, panel, primary_button, section_title};
+use crate::widgets::{
+    button, chip, field, panel, picture, primary_button, section_title, segmented, setting_row,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -23,6 +26,7 @@ enum Page {
     Cars,
     Tracks,
     Install,
+    Browser,
     Settings,
 }
 
@@ -57,6 +61,7 @@ impl Content {
 }
 
 struct InstallState {
+    root: PathBuf,
     archive: PathBuf,
     items: Vec<install::Item>,
 }
@@ -67,6 +72,7 @@ pub struct CmApp {
     content: Arc<Content>,
     loading: bool,
     page: Page,
+    browser: Option<Entity<BrowserView>>,
 
     car: Option<usize>,
     skin: usize,
@@ -88,6 +94,7 @@ pub struct CmApp {
     penalties: bool,
 
     install: Option<InstallState>,
+    install_generation: u64,
     busy: bool,
     status: Option<(String, bool)>,
     game_running: bool,
@@ -98,13 +105,118 @@ pub struct CmApp {
     in_proton: Entity<TextInput>,
 }
 
+const SIDEBAR_W: f32 = 190.;
+const CAR_LIST_W: f32 = 300.;
+const TRACK_LIST_W: f32 = 280.;
+const ROW_H: f32 = 52.;
+const CAR_THUMB_W: f32 = 76.;
+const TRACK_THUMB_W: f32 = 40.;
+/// Text width left in a list row: column minus its right border, the row's
+/// horizontal padding, selection border, thumbnail and gap.
+const fn row_text_w(list_w: f32, thumb_w: f32) -> f32 {
+    list_w - 1. - 16. - 2. - thumb_w - 8.
+}
+
+fn count_label(shown: usize, total: usize, noun: &str) -> String {
+    if shown == total {
+        format!("{total} {noun}")
+    } else {
+        format!("{shown} of {total} {noun}")
+    }
+}
+
+/// One clickable row of a virtualized list (fixed height, as `uniform_list` requires).
+fn list_row(ix: usize, selected: bool) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(ix)
+        .w_full()
+        .h(px(ROW_H))
+        .px_2()
+        .flex()
+        .items_center()
+        .gap_2()
+        .cursor_pointer()
+        .border_l_2()
+        .when(selected, |d| {
+            d.bg(theme::selected()).border_color(theme::accent())
+        })
+        .when(!selected, |d| {
+            d.border_color(gpui::transparent_black())
+                .hover(|s| s.bg(theme::panel_hover()))
+        })
+}
+
+/// Title + muted subtitle, both truncated with an ellipsis.
+///
+/// GPUI caches the first measurement of nowrap text, and inside flex layouts
+/// that first pass has no width limit, so `truncate` only works when the
+/// text's own box has a fixed pixel width. Pass it when known (list rows);
+/// `None` fills the remaining space and simply clips.
+fn two_lines(
+    title: impl Into<SharedString>,
+    sub: impl Into<SharedString>,
+    width: Option<f32>,
+) -> gpui::Div {
+    let line = |d: gpui::Div| match width {
+        Some(w) => d.w(px(w)),
+        None => d.w_full(),
+    };
+    div()
+        .flex()
+        .flex_col()
+        .map(|d| match width {
+            Some(w) => d.w(px(w)).flex_shrink_0(),
+            None => d.flex_1().min_w_0(),
+        })
+        .child(line(div()).text_sm().truncate().child(title.into()))
+        .child(
+            line(div())
+                .text_xs()
+                .text_color(theme::muted())
+                .truncate()
+                .child(sub.into()),
+        )
+}
+
+const INSTALL_MAX_W: f32 = 760.;
+const SETTINGS_MAX_W: f32 = 860.;
+/// Horizontal space a `panel()` takes from its content: `p_3` on both sides plus the border.
+const PANEL_INSET: f32 = 2. * 12. + 2.;
+
+/// Width for wrapping text inside a page column that is `p_4` padded and
+/// capped at `max_w`.
+///
+/// GPUI measures text once and caches the result, so text that wraps in a
+/// flex layout keeps its unwrapped (one line) height and spills over what
+/// follows. A definite pixel width makes the first measurement the right one.
+fn text_w(main_w: f32, max_w: f32) -> f32 {
+    (main_w.min(max_w) - 2. * 16.).max(120.)
+}
+
+/// A text input that takes the remaining width of a row.
+///
+/// The wrapper must be a flex container: under a plain block wrapper the
+/// input's `w_full` resolves before the flex item has grown and collapses to
+/// a few pixels.
+fn grow_input(input: Entity<TextInput>) -> gpui::Div {
+    div().flex().flex_1().min_w_0().child(input)
+}
+
 fn fmt_time(seconds: u32) -> String {
     format!("{:02}:{:02}", seconds / 3600, seconds % 3600 / 60)
 }
 
 impl CmApp {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let settings = Settings::load();
+        let (settings, settings_error) = match Settings::load() {
+            Ok(settings) => (settings, None),
+            Err(e) => (
+                Settings::default(),
+                Some(format!(
+                    "Settings could not be loaded: {e:#}. Fix the file and restart."
+                )),
+            ),
+        };
         let ac_root = settings
             .ac_root
             .clone()
@@ -113,28 +225,57 @@ impl CmApp {
 
         let car_filter = cx.new(|cx| TextInput::new(cx, "Search cars…", ""));
         let track_filter = cx.new(|cx| TextInput::new(cx, "Search tracks…", ""));
-        cx.observe(&car_filter, |this, _, cx| this.refilter(cx)).detach();
-        cx.observe(&track_filter, |this, _, cx| this.refilter(cx)).detach();
+        cx.observe(&car_filter, |this, _, cx| this.refilter(cx))
+            .detach();
+        cx.observe(&track_filter, |this, _, cx| this.refilter(cx))
+            .detach();
 
-        let root_text = ac_root.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+        let root_text = ac_root
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
         let in_root = cx.new(|cx| TextInput::new(cx, "Assetto Corsa folder", root_text));
-        let in_driver = cx.new(|cx| TextInput::new(cx, "Driver name", settings.driver_name.clone()));
+        let in_driver =
+            cx.new(|cx| TextInput::new(cx, "Driver name", settings.driver_name.clone()));
         let in_nation = cx.new(|cx| TextInput::new(cx, "ITA", settings.nationality.clone()));
-        let proton_text = settings.proton.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+        let proton_text = settings
+            .proton
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
         let in_proton = cx.new(|cx| TextInput::new(cx, "Auto-detect", proton_text));
 
         let last = settings.last_quick_drive.clone().unwrap_or_default();
         let (mode, practice_minutes, laps, opponents, ai_level, start_position) = match last.mode {
             Mode::Practice { minutes } => (ModeKind::Practice, minutes, 5, 7, 95, 8),
             Mode::Hotlap => (ModeKind::Hotlap, 0, 5, 7, 95, 8),
-            Mode::Race { laps, opponents, ai_level, starting_position } => {
-                (ModeKind::Race, 0, laps, opponents, ai_level, starting_position)
-            }
+            Mode::Race {
+                laps,
+                opponents,
+                ai_level,
+                starting_position,
+            } => (
+                ModeKind::Race,
+                0,
+                laps,
+                opponents,
+                ai_level,
+                starting_position,
+            ),
         };
-        let c = if last.conditions.weather_id.is_empty() { Conditions::default() } else { last.conditions.clone() };
+        let c = if last.conditions.weather_id.is_empty() {
+            Conditions::default()
+        } else {
+            last.conditions.clone()
+        };
 
         let mut this = Self {
-            page: if ac_root.is_some() { Page::QuickDrive } else { Page::Settings },
+            page: if ac_root.is_some() {
+                Page::QuickDrive
+            } else {
+                Page::Settings
+            },
+            browser: None,
             settings,
             ac_root,
             content: Arc::default(),
@@ -157,6 +298,7 @@ impl CmApp {
             weather_id: c.weather_id,
             penalties: last.penalties || last.car_id.is_empty(),
             install: None,
+            install_generation: 0,
             busy: false,
             status: None,
             game_running: false,
@@ -166,9 +308,17 @@ impl CmApp {
             in_proton,
         };
         if this.ac_root.is_none() {
-            this.status = Some(("Assetto Corsa wasn't found. Set its folder in Settings.".into(), true));
+            this.status = Some((
+                "Assetto Corsa wasn't found. Set its folder in Settings.".into(),
+                true,
+            ));
         }
-        this.reload(cx);
+        if let Some(error) = settings_error {
+            this.page = Page::Settings;
+            this.status = Some((error, true));
+        } else {
+            this.reload(cx);
+        }
         this
     }
 
@@ -180,18 +330,27 @@ impl CmApp {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
-        let Some(root) = self.ac_root.clone() else { return };
+        let Some(root) = self.ac_root.clone() else {
+            return;
+        };
         self.loading = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let content = cx.background_executor().spawn(async move { Content::scan(&root) }).await;
+            let content = cx
+                .background_executor()
+                .spawn(async move { Content::scan(&root) })
+                .await;
             this.update(cx, |this, cx| {
                 this.content = Arc::new(content);
                 this.loading = false;
                 this.restore_selection();
                 this.refilter(cx);
                 let n = (this.content.cars.len(), this.content.tracks.len());
-                this.set_status(format!("Loaded {} cars and {} track layouts", n.0, n.1), false, cx);
+                this.set_status(
+                    format!("Loaded {} cars and {} track layouts", n.0, n.1),
+                    false,
+                    cx,
+                );
             })
             .ok();
         })
@@ -201,7 +360,11 @@ impl CmApp {
     fn restore_selection(&mut self) {
         let last = self.settings.last_quick_drive.clone().unwrap_or_default();
         let c = &self.content;
-        self.car = c.cars.iter().position(|x| x.id == last.car_id).or((!c.cars.is_empty()).then_some(0));
+        self.car = c
+            .cars
+            .iter()
+            .position(|x| x.id == last.car_id)
+            .or((!c.cars.is_empty()).then_some(0));
         self.skin = self
             .car
             .and_then(|i| c.cars[i].skins.iter().position(|s| s.id == last.skin_id))
@@ -222,8 +385,12 @@ impl CmApp {
         let car_q = self.car_filter.read(cx).text().to_lowercase();
         let track_q = self.track_filter.read(cx).text().to_lowercase();
         let matches = |hay: &str, q: &str| q.split_whitespace().all(|w| hay.contains(w));
-        self.cars_view = (0..self.content.cars.len()).filter(|&i| matches(&self.content.car_search[i], &car_q)).collect();
-        self.tracks_view = (0..self.content.tracks.len()).filter(|&i| matches(&self.content.track_search[i], &track_q)).collect();
+        self.cars_view = (0..self.content.cars.len())
+            .filter(|&i| matches(&self.content.car_search[i], &car_q))
+            .collect();
+        self.tracks_view = (0..self.content.tracks.len())
+            .filter(|&i| matches(&self.content.track_search[i], &track_q))
+            .collect();
         cx.notify();
     }
 
@@ -238,9 +405,15 @@ impl CmApp {
     fn quick_drive(&self, cx: &Context<Self>) -> Option<QuickDrive> {
         let car = self.selected_car()?;
         let track = self.selected_track()?;
-        let skin_id = car.skins.get(self.skin).map(|s| s.id.clone()).unwrap_or_default();
+        let skin_id = car
+            .skins
+            .get(self.skin)
+            .map(|s| s.id.clone())
+            .unwrap_or_default();
         let mode = match self.mode {
-            ModeKind::Practice => Mode::Practice { minutes: self.practice_minutes },
+            ModeKind::Practice => Mode::Practice {
+                minutes: self.practice_minutes,
+            },
             ModeKind::Hotlap => Mode::Hotlap,
             ModeKind::Race => Mode::Race {
                 laps: self.laps,
@@ -284,29 +457,46 @@ impl CmApp {
         if self.mode == ModeKind::Race {
             if let Some(t) = self.selected_track().and_then(|t| t.layout.pitboxes) {
                 if self.opponents + 1 > t {
-                    return self.set_status(format!("This track has only {t} pit boxes; lower the opponent count."), true, cx);
+                    return self.set_status(
+                        format!("This track has only {t} pit boxes; lower the opponent count."),
+                        true,
+                        cx,
+                    );
                 }
             }
         }
         self.settings.last_quick_drive = Some(q.clone());
-        let _ = self.settings.save();
+        if let Err(e) = self.settings.save() {
+            return self.set_status(format!("Couldn't save settings: {e:#}"), true, cx);
+        }
 
         if let Err(e) = launch::write_race_ini(&root, &q) {
             return self.set_status(format!("Couldn't write race.ini: {e:#}"), true, cx);
         }
-        let opts = launch::LaunchOptions { proton: self.settings.proton.clone() };
+        let opts = launch::LaunchOptions {
+            proton: self.settings.proton.clone(),
+        };
         match launch::start(&root, &opts) {
             Ok(mut child) => {
                 self.game_running = true;
                 self.set_status("Assetto Corsa is starting…", false, cx);
                 cx.spawn(async move |this, cx| {
-                    let code = cx.background_executor().spawn(async move { child.wait() }).await;
+                    let code = cx
+                        .background_executor()
+                        .spawn(async move { child.wait() })
+                        .await;
                     this.update(cx, |this, cx| {
                         this.game_running = false;
                         match code {
                             Ok(c) if c.success() => this.set_status("Game closed.", false, cx),
-                            Ok(c) => this.set_status(format!("Game exited with {c}. Is Steam running?"), true, cx),
-                            Err(e) => this.set_status(format!("Lost track of the game: {e}"), true, cx),
+                            Ok(c) => this.set_status(
+                                format!("Game exited with {c}. Is Steam running?"),
+                                true,
+                                cx,
+                            ),
+                            Err(e) => {
+                                this.set_status(format!("Lost track of the game: {e}"), true, cx)
+                            }
                         }
                     })
                     .ok();
@@ -321,7 +511,11 @@ impl CmApp {
         let root_text = self.in_root.read(cx).text();
         let root = PathBuf::from(root_text.trim());
         if !paths::is_ac_root(&root) {
-            return self.set_status("That folder doesn't contain acs.exe and content/cars.", true, cx);
+            return self.set_status(
+                "That folder doesn't contain acs.exe and content/cars.",
+                true,
+                cx,
+            );
         }
         let proton = self.in_proton.read(cx).text();
         self.settings.ac_root = Some(root.clone());
@@ -350,7 +544,8 @@ impl CmApp {
             if let Ok(Ok(Some(paths))) = rx.await {
                 if let Some(p) = paths.into_iter().next() {
                     this.update(cx, |this, cx| {
-                        this.in_root.update(cx, |i, cx| i.set_text(p.display().to_string(), cx));
+                        this.in_root
+                            .update(cx, |i, cx| i.set_text(p.display().to_string(), cx));
                     })
                     .ok();
                 }
@@ -362,35 +557,79 @@ impl CmApp {
     fn detect_root(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         match paths::find_ac_root() {
             Some(p) => {
-                self.in_root.update(cx, |i, cx| i.set_text(p.display().to_string(), cx));
+                self.in_root
+                    .update(cx, |i, cx| i.set_text(p.display().to_string(), cx));
                 self.set_status(format!("Found {}", p.display()), false, cx);
             }
-            None => self.set_status("Couldn't find Assetto Corsa in any Steam library.", true, cx),
+            None => self.set_status(
+                "Couldn't find Assetto Corsa in any Steam library.",
+                true,
+                cx,
+            ),
         }
     }
 
-    fn choose_archive(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(root) = self.ac_root.clone() else { return };
-        let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Select a mod archive (.zip)".into()),
-        });
+    fn ensure_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.browser.is_some() {
+            return;
+        }
+        let browser = cx.new(|cx| BrowserView::new(window, cx));
+        cx.subscribe(&browser, |this, _, event: &PreviewDownload, cx| {
+            if this.busy {
+                this.set_status("Wait for the current installation to finish.", true, cx);
+                return;
+            }
+            this.preview_archive(event.0.clone(), cx);
+        })
+        .detach();
+        self.browser = Some(browser);
+    }
+
+    fn preview_archive(&mut self, archive: PathBuf, cx: &mut Context<Self>) {
+        let Some(root) = self.ac_root.clone() else {
+            self.set_status(
+                "Set your Assetto Corsa folder in Settings before installing mods.",
+                true,
+                cx,
+            );
+            return;
+        };
+        if self.busy {
+            return;
+        }
+        if let Some(browser) = &self.browser {
+            browser.update(cx, |browser, cx| browser.set_active(false, cx));
+        }
+        self.install_generation = self.install_generation.wrapping_add(1);
+        let generation = self.install_generation;
+        self.install = None;
+        self.page = Page::Install;
+        self.set_status("Inspecting archive…", false, cx);
         cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(paths))) = rx.await else { return };
-            let Some(archive) = paths.into_iter().next() else { return };
             let a = archive.clone();
-            let plan = cx.background_executor().spawn(async move { install::plan_zip(&a, &root) }).await;
-            this.update(cx, |this, cx| match plan {
-                Ok(items) => {
-                    this.install = Some(InstallState { archive, items });
-                    this.status = None;
-                    cx.notify();
+            let planned_root = root.clone();
+            let plan = cx
+                .background_executor()
+                .spawn(async move { install::plan_zip(&a, &planned_root) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.install_generation != generation
+                    || this.ac_root.as_ref() != Some(&root)
+                    || this.busy
+                {
+                    return;
                 }
-                Err(e) => {
-                    this.install = None;
-                    this.set_status(format!("{e:#}"), true, cx);
+                match plan {
+                    Ok(items) => {
+                        this.install = Some(InstallState {
+                            root: root.clone(),
+                            archive,
+                            items,
+                        });
+                        this.status = None;
+                        cx.notify();
+                    }
+                    Err(e) => this.set_status(format!("{e:#}"), true, cx),
                 }
             })
             .ok();
@@ -398,19 +637,62 @@ impl CmApp {
         .detach();
     }
 
+    fn choose_archive(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.ac_root.is_none() {
+            return;
+        }
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Select a mod archive (.zip)".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else {
+                return;
+            };
+            let Some(archive) = paths.into_iter().next() else {
+                return;
+            };
+            this.update(cx, |this, cx| this.preview_archive(archive, cx))
+                .ok();
+        })
+        .detach();
+    }
+
     fn do_install(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(state) = self.install.take() else { return };
+        if self.busy {
+            return;
+        }
+        let Some(state) = self.install.take() else {
+            return;
+        };
+        if self.ac_root.as_ref() != Some(&state.root) {
+            self.set_status(
+                "Game folder changed. Preview the archive again before installing.",
+                true,
+                cx,
+            );
+            return;
+        }
         self.busy = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let InstallState { archive, items } = state;
+            let InstallState { archive, items, .. } = state;
             let n = items.len();
-            let result = cx.background_executor().spawn(async move { install::install_zip(&archive, &items) }).await;
+            let result = cx
+                .background_executor()
+                .spawn(async move { install::install_zip(&archive, &items) })
+                .await;
             this.update(cx, |this, cx| {
                 this.busy = false;
                 match result {
                     Ok(files) => {
-                        this.set_status(format!("Installed {n} item(s), {files} files."), false, cx);
+                        this.set_status(
+                            format!("Installed {n} item(s), {files} files."),
+                            false,
+                            cx,
+                        );
                         this.reload(cx);
                     }
                     Err(e) => this.set_status(format!("Install failed: {e:#}"), true, cx),
@@ -422,19 +704,31 @@ impl CmApp {
     }
 
     fn unpack_acd(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(car) = self.selected_car() else { return };
+        let Some(car) = self.selected_car() else {
+            return;
+        };
         let out = car.dir.join("data");
         if out.exists() {
-            return self.set_status("This car already has a data folder; not overwriting it.", true, cx);
+            return self.set_status(
+                "This car already has a data folder; not overwriting it.",
+                true,
+                cx,
+            );
         }
         match acd::unpack(&car.dir.join("data.acd"), &out) {
-            Ok(n) => self.set_status(format!("Unpacked {n} files to {}", out.display()), false, cx),
+            Ok(n) => self.set_status(
+                format!("Unpacked {n} files to {}", out.display()),
+                false,
+                cx,
+            ),
             Err(e) => self.set_status(format!("Unpack failed: {e:#}"), true, cx),
         }
     }
 
     fn pack_acd(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(car) = self.selected_car() else { return };
+        let Some(car) = self.selected_car() else {
+            return;
+        };
         let acd_path = car.dir.join("data.acd");
         if acd_path.exists() {
             let backup = car.dir.join("data.acd~cm-rs-backup");
@@ -443,14 +737,23 @@ impl CmApp {
             }
         }
         match acd::pack(&car.dir.join("data"), &acd_path) {
-            Ok(n) => self.set_status(format!("Packed {n} files into data.acd (old one kept as data.acd~cm-rs-backup)"), false, cx),
+            Ok(n) => self.set_status(
+                format!("Packed {n} files into data.acd (old one kept as data.acd~cm-rs-backup)"),
+                false,
+                cx,
+            ),
             Err(e) => self.set_status(format!("Pack failed: {e:#}"), true, cx),
         }
     }
 
     // ---------- views ----------
 
-    fn nav_item(&self, page: Page, label: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
+    fn nav_item(
+        &self,
+        page: Page,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let active = self.page == page;
         div()
             .id(label)
@@ -459,161 +762,169 @@ impl CmApp {
             .text_sm()
             .cursor_pointer()
             .border_l_2()
-            .when(active, |d| d.border_color(theme::accent()).bg(theme::panel()).text_color(theme::text()))
-            .when(!active, |d| d.border_color(theme::sidebar()).text_color(theme::muted()).hover(|s| s.text_color(theme::text())))
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .when(active, |d| {
+                d.border_color(theme::accent())
+                    .bg(theme::panel())
+                    .text_color(theme::text())
+            })
+            .when(!active, |d| {
+                d.border_color(theme::sidebar())
+                    .text_color(theme::muted())
+                    .hover(|s| s.text_color(theme::text()))
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if page == Page::Browser {
+                    this.ensure_browser(window, cx);
+                }
+                if let Some(browser) = &this.browser {
+                    browser.update(cx, |browser, cx| {
+                        browser.set_active(page == Page::Browser, cx)
+                    });
+                }
                 this.page = page;
                 cx.notify();
             }))
             .child(label)
     }
 
-    fn car_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .w(px(320.))
-            .flex_shrink_0()
-            .h_full()
-            .border_r_1()
-            .border_color(theme::border())
-            .child(div().flex().w_full().p_2().child(self.car_filter.clone()))
-            .child(
-                uniform_list(
-                    "car-list",
-                    self.cars_view.len(),
-                    cx.processor(|this, range: Range<usize>, _window, cx| {
-                        range
-                            .map(|ix| {
-                                let car_ix = this.cars_view[ix];
-                                let car = &this.content.cars[car_ix];
-                                let selected = this.car == Some(car_ix);
-                                let sub = [car.brand.clone(), car.class.clone()]
-                                    .into_iter()
-                                    .flatten()
-                                    .collect::<Vec<_>>()
-                                    .join(" · ");
-                                div()
-                                    .id(ix)
-                                    .w_full()
-                                    .h(px(52.))
-                                    .px_2()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .cursor_pointer()
-                                    .when(selected, |d| d.bg(theme::selected()))
-                                    .when(!selected, |d| d.hover(|s| s.bg(theme::panel_hover())))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.car = Some(car_ix);
-                                        this.skin = 0;
-                                        cx.notify();
-                                    }))
-                                    .child(
-                                        div().w(px(76.)).h(px(43.)).flex_shrink_0().bg(theme::panel()).rounded_sm().overflow_hidden().when_some(
-                                            car.preview().map(|p| p.to_path_buf()),
-                                            |d, p| d.child(img(p).size_full().object_fit(ObjectFit::Cover)),
-                                        ),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .min_w_0()
-                                            .child(div().text_sm().truncate().child(car.name.clone()))
-                                            .child(div().text_xs().text_color(theme::muted()).truncate().child(sub)),
-                                    )
-                            })
-                            .collect()
-                    }),
-                )
-                .flex_1(),
-            )
-    }
-
-    fn track_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .w(px(300.))
-            .flex_shrink_0()
-            .h_full()
-            .border_r_1()
-            .border_color(theme::border())
-            .child(div().flex().w_full().p_2().child(self.track_filter.clone()))
-            .child(
-                uniform_list(
-                    "track-list",
-                    self.tracks_view.len(),
-                    cx.processor(|this, range: Range<usize>, _window, cx| {
-                        range
-                            .map(|ix| {
-                                let t_ix = this.tracks_view[ix];
-                                let t = &this.content.tracks[t_ix];
-                                let selected = this.track == Some(t_ix);
-                                let sub = [t.layout.country.clone(), t.layout.length.clone().map(|l| format!("{l} m"))]
-                                    .into_iter()
-                                    .flatten()
-                                    .collect::<Vec<_>>()
-                                    .join(" · ");
-                                div()
-                                    .id(ix)
-                                    .w_full()
-                                    .h(px(52.))
-                                    .px_2()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .cursor_pointer()
-                                    .when(selected, |d| d.bg(theme::selected()))
-                                    .when(!selected, |d| d.hover(|s| s.bg(theme::panel_hover())))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.track = Some(t_ix);
-                                        cx.notify();
-                                    }))
-                                    .child(
-                                        div().w(px(43.)).h(px(43.)).flex_shrink_0().when_some(t.layout.outline.clone(), |d, p| {
-                                            d.child(img(p).size_full().object_fit(ObjectFit::Contain))
-                                        }),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .min_w_0()
-                                            .child(div().text_sm().truncate().child(t.layout.name.clone()))
-                                            .child(div().text_xs().text_color(theme::muted()).truncate().child(sub)),
-                                    )
-                            })
-                            .collect()
-                    }),
-                )
-                .flex_1(),
-            )
-    }
-
-    fn stepper(
+    /// Search box, "shown of total" line and the list itself.
+    fn list_column(
         &self,
-        id: &'static str,
-        label: &'static str,
-        value: String,
-        step: fn(&mut CmApp, i32),
-        cx: &mut Context<Self>,
+        width: f32,
+        filter: Entity<TextInput>,
+        counter: String,
+        list: impl IntoElement,
     ) -> impl IntoElement {
         div()
             .flex()
+            .flex_col()
+            .w(px(width))
+            .flex_shrink_0()
+            .h_full()
+            .border_r_1()
+            .border_color(theme::border())
+            .child(div().flex().w_full().px_2().pt_2().child(filter))
+            .child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child(counter),
+            )
+            .child(list)
+    }
+
+    fn car_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let counter = count_label(self.cars_view.len(), self.content.cars.len(), "cars");
+        let list = uniform_list(
+            "car-list",
+            self.cars_view.len(),
+            cx.processor(|this, range: Range<usize>, _window, cx| {
+                range
+                    .map(|ix| {
+                        let car_ix = this.cars_view[ix];
+                        let car = &this.content.cars[car_ix];
+                        let selected = this.car == Some(car_ix);
+                        let sub = [car.brand.clone(), car.class.clone()]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join(" · ");
+                        list_row(ix, selected)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.car = Some(car_ix);
+                                this.skin = 0;
+                                cx.notify();
+                            }))
+                            .child(
+                                picture(car.preview().map(|p| p.to_path_buf()), 43.)
+                                    .w(px(CAR_THUMB_W)),
+                            )
+                            .child(two_lines(
+                                car.name.clone(),
+                                sub,
+                                Some(row_text_w(CAR_LIST_W, CAR_THUMB_W)),
+                            ))
+                    })
+                    .collect()
+            }),
+        )
+        .flex_1();
+        self.list_column(CAR_LIST_W, self.car_filter.clone(), counter, list)
+    }
+
+    fn track_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let counter = count_label(self.tracks_view.len(), self.content.tracks.len(), "layouts");
+        let list = uniform_list(
+            "track-list",
+            self.tracks_view.len(),
+            cx.processor(|this, range: Range<usize>, _window, cx| {
+                range
+                    .map(|ix| {
+                        let t_ix = this.tracks_view[ix];
+                        let t = &this.content.tracks[t_ix];
+                        let selected = this.track == Some(t_ix);
+                        let sub = [
+                            t.layout.country.clone(),
+                            t.layout.length.clone().map(|l| format!("{l} m")),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                        list_row(ix, selected)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.track = Some(t_ix);
+                                cx.notify();
+                            }))
+                            .child(
+                                picture(t.layout.outline.clone(), TRACK_THUMB_W)
+                                    .w(px(TRACK_THUMB_W)),
+                            )
+                            .child(two_lines(
+                                t.layout.name.clone(),
+                                sub,
+                                Some(row_text_w(TRACK_LIST_W, TRACK_THUMB_W)),
+                            ))
+                    })
+                    .collect()
+            }),
+        )
+        .flex_1();
+        self.list_column(TRACK_LIST_W, self.track_filter.clone(), counter, list)
+    }
+
+    /// `−  value  +` control; pair it with [`setting_row`] for the label.
+    fn stepper(
+        &self,
+        id: &'static str,
+        value: String,
+        step: fn(&mut CmApp, i32),
+        cx: &mut Context<Self>,
+    ) -> Div {
+        div()
+            .flex()
             .items_center()
-            .gap_2()
-            .child(div().w(px(140.)).text_sm().text_color(theme::muted()).child(label))
-            .child(button((id, 0usize), "−").on_click(cx.listener(move |this, _, _, cx| {
-                step(this, -1);
-                cx.notify();
-            })))
-            .child(div().w(px(170.)).text_center().text_sm().child(value))
-            .child(button((id, 1usize), "+").on_click(cx.listener(move |this, _, _, cx| {
-                step(this, 1);
-                cx.notify();
-            })))
+            .gap_1()
+            .child(
+                button((id, 0usize), "−").on_click(cx.listener(move |this, _, _, cx| {
+                    step(this, -1);
+                    cx.notify();
+                })),
+            )
+            .child(div().w(px(96.)).text_center().text_sm().child(value))
+            .child(
+                button((id, 1usize), "+").on_click(cx.listener(move |this, _, _, cx| {
+                    step(this, 1);
+                    cx.notify();
+                })),
+            )
+    }
+
+    fn open_quick_drive(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.page = Page::QuickDrive;
+        cx.notify();
     }
 
     fn quick_drive_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -622,123 +933,201 @@ impl CmApp {
         let track = self.selected_track();
         let skin_count = car.map(|c| c.skins.len()).unwrap_or(0);
 
+        let skin_label = skin
+            .map(|s| format!("Skin: {} · {}/{}", s.name, self.skin + 1, skin_count))
+            .unwrap_or_else(|| "No skins".into());
         let car_block = panel()
             .flex()
             .flex_col()
             .gap_2()
-            .child(div().text_lg().font_weight(FontWeight::BOLD).child(car.map(|c| c.name.clone()).unwrap_or_else(|| "No car".into())))
-            .child(
-                div().w_full().h(px(220.)).bg(theme::bg()).rounded_sm().overflow_hidden().when_some(
-                    skin.and_then(|s| s.preview.clone()),
-                    |d, p| d.child(img(p).size_full().object_fit(ObjectFit::Contain)),
-                ),
-            )
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(button("skin-prev", "◀").on_click(cx.listener(move |this, _, _, cx| {
-                        if skin_count > 0 {
-                            this.skin = (this.skin + skin_count - 1) % skin_count;
-                            cx.notify();
-                        }
-                    })))
+                    .child(two_lines(
+                        car.map(|c| c.name.clone())
+                            .unwrap_or_else(|| "No car".into()),
+                        skin_label,
+                        None,
+                    ))
                     .child(
-                        div()
-                            .flex_1()
-                            .text_center()
-                            .text_sm()
-                            .child(skin.map(|s| format!("{} ({}/{})", s.name, self.skin + 1, skin_count)).unwrap_or_else(|| "No skins".into())),
+                        button("skin-prev", "◀").on_click(cx.listener(move |this, _, _, cx| {
+                            if skin_count > 0 {
+                                this.skin = (this.skin + skin_count - 1) % skin_count;
+                                cx.notify();
+                            }
+                        })),
                     )
-                    .child(button("skin-next", "▶").on_click(cx.listener(move |this, _, _, cx| {
-                        if skin_count > 0 {
-                            this.skin = (this.skin + 1) % skin_count;
-                            cx.notify();
-                        }
-                    }))),
-            );
+                    .child(button("skin-next", "▶").on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            if skin_count > 0 {
+                                this.skin = (this.skin + 1) % skin_count;
+                                cx.notify();
+                            }
+                        },
+                    ))),
+            )
+            .child(picture(skin.and_then(|s| s.preview.clone()), 240.).w_full());
 
         let track_block = panel()
             .flex()
+            .items_center()
             .gap_3()
-            .child(
-                div().w(px(160.)).h(px(90.)).flex_shrink_0().bg(theme::bg()).rounded_sm().overflow_hidden().when_some(
-                    track.and_then(|t| t.layout.preview.clone()),
-                    |d, p| d.child(img(p).size_full().object_fit(ObjectFit::Cover)),
-                ),
-            )
+            .child(picture(track.and_then(|t| t.layout.preview.clone()), 72.).w(px(128.)))
             .child(
                 div()
                     .flex()
                     .flex_col()
+                    .flex_1()
+                    .min_w_0()
                     .gap_1()
-                    .child(div().font_weight(FontWeight::BOLD).child(track.map(|t| t.layout.name.clone()).unwrap_or_else(|| "No track".into())))
+                    .child(
+                        div().font_weight(FontWeight::BOLD).truncate().child(
+                            track
+                                .map(|t| t.layout.name.clone())
+                                .unwrap_or_else(|| "No track".into()),
+                        ),
+                    )
                     .when_some(track, |d, t| {
-                        d.child(div().text_sm().text_color(theme::muted()).child(
-                            [t.layout.city.clone(), t.layout.country.clone()].into_iter().flatten().collect::<Vec<_>>().join(", "),
-                        ))
-                        .child(div().text_sm().text_color(theme::muted()).child(format!(
+                        let place = [t.layout.city.clone(), t.layout.country.clone()]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let size = format!(
                             "{} · {} pit boxes",
-                            t.layout.length.clone().map(|l| format!("{l} m")).unwrap_or_else(|| "length ?".into()),
-                            t.layout.pitboxes.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
-                        )))
+                            t.layout
+                                .length
+                                .clone()
+                                .map(|l| format!("{l} m"))
+                                .unwrap_or_else(|| "length ?".into()),
+                            t.layout
+                                .pitboxes
+                                .map(|p| p.to_string())
+                                .unwrap_or_else(|| "?".into())
+                        );
+                        d.child(
+                            div()
+                                .text_sm()
+                                .text_color(theme::muted())
+                                .truncate()
+                                .child(place),
+                        )
+                        .child(div().text_sm().text_color(theme::muted()).child(size))
                     }),
-            );
+            )
+            .child(picture(track.and_then(|t| t.layout.outline.clone()), 72.).w(px(72.)));
 
-        let mut mode_block = panel()
+        let mut session = panel()
             .flex()
             .flex_col()
             .gap_2()
-            .child(section_title("Mode"))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(chip("mode-practice", "Practice", self.mode == ModeKind::Practice).on_click(cx.listener(|this, _, _, cx| {
-                        this.mode = ModeKind::Practice;
-                        cx.notify();
-                    })))
-                    .child(chip("mode-hotlap", "Hotlap", self.mode == ModeKind::Hotlap).on_click(cx.listener(|this, _, _, cx| {
-                        this.mode = ModeKind::Hotlap;
-                        cx.notify();
-                    })))
-                    .child(chip("mode-race", "Quick race", self.mode == ModeKind::Race).on_click(cx.listener(|this, _, _, cx| {
-                        this.mode = ModeKind::Race;
-                        cx.notify();
-                    }))),
-            );
+            .child(section_title("Session"))
+            .child(setting_row(
+                "Mode",
+                segmented(vec![
+                    chip("mode-practice", "Practice", self.mode == ModeKind::Practice).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.mode = ModeKind::Practice;
+                            cx.notify();
+                        }),
+                    ),
+                    chip("mode-hotlap", "Hotlap", self.mode == ModeKind::Hotlap).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.mode = ModeKind::Hotlap;
+                            cx.notify();
+                        }),
+                    ),
+                    chip("mode-race", "Quick race", self.mode == ModeKind::Race).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.mode = ModeKind::Race;
+                            cx.notify();
+                        }),
+                    ),
+                ]),
+            ));
         match self.mode {
             ModeKind::Practice => {
-                let label = if self.practice_minutes == 0 { "Unlimited".to_string() } else { format!("{} min", self.practice_minutes) };
-                mode_block = mode_block.child(self.stepper("minutes", "Duration", label, |t, d| {
-                    t.practice_minutes = (t.practice_minutes as i32 + d * 5).clamp(0, 240) as u32
-                }, cx));
+                let label = if self.practice_minutes == 0 {
+                    "Unlimited".to_string()
+                } else {
+                    format!("{} min", self.practice_minutes)
+                };
+                session = session.child(setting_row(
+                    "Duration",
+                    self.stepper(
+                        "minutes",
+                        label,
+                        |t, d| {
+                            t.practice_minutes =
+                                (t.practice_minutes as i32 + d * 5).clamp(0, 240) as u32
+                        },
+                        cx,
+                    ),
+                ));
             }
             ModeKind::Hotlap => {}
             ModeKind::Race => {
-                mode_block = mode_block
-                    .child(self.stepper("laps", "Laps", self.laps.to_string(), |t, d| t.laps = (t.laps as i32 + d).clamp(1, 200) as u32, cx))
-                    .child(self.stepper("opponents", "Opponents", self.opponents.to_string(), |t, d| {
-                        t.opponents = (t.opponents as i32 + d).clamp(1, 40) as u32;
-                        t.start_position = t.start_position.min(t.opponents + 1);
-                    }, cx))
-                    .child(self.stepper("ai", "AI strength", format!("{}%", self.ai_level), |t, d| {
-                        t.ai_level = (t.ai_level as i32 + d).clamp(70, 100) as u32
-                    }, cx))
-                    .child(self.stepper("grid", "Start position", self.start_position.to_string(), |t, d| {
-                        t.start_position = (t.start_position as i32 + d).clamp(1, t.opponents as i32 + 1) as u32
-                    }, cx));
+                session = session
+                    .child(setting_row(
+                        "Laps",
+                        self.stepper(
+                            "laps",
+                            self.laps.to_string(),
+                            |t, d| t.laps = (t.laps as i32 + d).clamp(1, 200) as u32,
+                            cx,
+                        ),
+                    ))
+                    .child(setting_row(
+                        "Opponents",
+                        self.stepper(
+                            "opponents",
+                            self.opponents.to_string(),
+                            |t, d| {
+                                t.opponents = (t.opponents as i32 + d).clamp(1, 40) as u32;
+                                t.start_position = t.start_position.min(t.opponents + 1);
+                            },
+                            cx,
+                        ),
+                    ))
+                    .child(setting_row(
+                        "AI strength",
+                        self.stepper(
+                            "ai",
+                            format!("{}%", self.ai_level),
+                            |t, d| t.ai_level = (t.ai_level as i32 + d).clamp(70, 100) as u32,
+                            cx,
+                        ),
+                    ))
+                    .child(setting_row(
+                        "Start position",
+                        self.stepper(
+                            "grid",
+                            self.start_position.to_string(),
+                            |t, d| {
+                                t.start_position = (t.start_position as i32 + d)
+                                    .clamp(1, t.opponents as i32 + 1)
+                                    as u32
+                            },
+                            cx,
+                        ),
+                    ));
             }
         }
-        mode_block = mode_block.child(
-            div().flex().items_center().gap_2().child(div().w(px(140.)).text_sm().text_color(theme::muted()).child("Penalties")).child(
-                chip("penalties", if self.penalties { "On" } else { "Off" }, self.penalties).on_click(cx.listener(|this, _, _, cx| {
-                    this.penalties = !this.penalties;
+        session = session.child(setting_row(
+            "Penalties",
+            segmented(vec![
+                chip("pen-on", "On", self.penalties).on_click(cx.listener(|this, _, _, cx| {
+                    this.penalties = true;
                     cx.notify();
                 })),
-            ),
-        );
+                chip("pen-off", "Off", !self.penalties).on_click(cx.listener(|this, _, _, cx| {
+                    this.penalties = false;
+                    cx.notify();
+                })),
+            ]),
+        ));
 
         let road = race::road_temperature(self.time_seconds as f64, self.ambient as f64, 1.0);
         let conditions = panel()
@@ -746,23 +1135,96 @@ impl CmApp {
             .flex_col()
             .gap_2()
             .child(section_title("Conditions"))
-            .child(self.stepper("time", "Time", fmt_time(self.time_seconds), |t, d| {
-                t.time_seconds = (t.time_seconds as i32 + d * 1800).clamp(race::TIME_MIN as i32, race::TIME_MAX as i32) as u32
-            }, cx))
-            .child(self.stepper("temp", "Temperature", format!("{}°C (road {:.0}°C)", self.ambient, road), |t, d| {
-                t.ambient = (t.ambient + d).clamp(0, 40)
-            }, cx))
+            .child(setting_row(
+                "Time",
+                self.stepper(
+                    "time",
+                    fmt_time(self.time_seconds),
+                    |t, d| {
+                        t.time_seconds = (t.time_seconds as i32 + d * 1800)
+                            .clamp(race::TIME_MIN as i32, race::TIME_MAX as i32)
+                            as u32
+                    },
+                    cx,
+                ),
+            ))
+            .child(setting_row(
+                "Temperature",
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(self.stepper(
+                        "temp",
+                        format!("{}°C", self.ambient),
+                        |t, d| t.ambient = (t.ambient + d).clamp(0, 40),
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(format!("road {road:.0}°C")),
+                    ),
+            ))
+            .child(setting_row(
+                "Weather",
+                div().flex().flex_1().flex_wrap().gap_1().children(
+                    self.content.weather.iter().enumerate().map(|(i, w)| {
+                        let id = w.id.clone();
+                        chip(("weather", i), w.name.clone(), self.weather_id == w.id).on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.weather_id = id.clone();
+                                cx.notify();
+                            }),
+                        )
+                    }),
+                ),
+            ));
+
+        let mode_name = match self.mode {
+            ModeKind::Practice => "Practice",
+            ModeKind::Hotlap => "Hotlap",
+            ModeKind::Race => "Quick race",
+        };
+        let summary = [
+            car.map(|c| c.name.clone()),
+            track.map(|t| t.layout.name.clone()),
+            Some(mode_name.to_owned()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("  ·  ");
+        let go_label = if self.game_running {
+            "Running…"
+        } else {
+            "Go!"
+        };
+        let footer = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .py_2()
+            .border_t_1()
+            .border_color(theme::border())
+            .bg(theme::sidebar())
             .child(
-                div().flex().flex_wrap().gap_2().children(self.content.weather.iter().enumerate().map(|(i, w)| {
-                    let id = w.id.clone();
-                    chip(("weather", i), w.name.clone(), self.weather_id == w.id).on_click(cx.listener(move |this, _, _, cx| {
-                        this.weather_id = id.clone();
-                        cx.notify();
-                    }))
-                })),
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .text_color(theme::muted())
+                    .truncate()
+                    .child(summary),
+            )
+            .child(
+                primary_button("go", go_label)
+                    .when(self.game_running, |d| d.opacity(0.6))
+                    .when(!self.game_running, |d| d.on_click(cx.listener(Self::go))),
             );
 
-        let go_label = if self.game_running { "Running…" } else { "Go!" };
         div()
             .flex()
             .size_full()
@@ -770,188 +1232,342 @@ impl CmApp {
             .child(self.track_list(cx))
             .child(
                 div()
-                    .id("qd-detail")
+                    .flex()
+                    .flex_col()
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .overflow_y_scroll()
-                    .p_4()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(car_block)
-                    .child(track_block)
-                    .child(mode_block)
-                    .child(conditions)
                     .child(
-                        div().flex().justify_end().child(
-                            primary_button("go", go_label)
-                                .when(self.game_running, |d| d.opacity(0.6))
-                                .when(!self.game_running, |d| d.on_click(cx.listener(Self::go))),
-                        ),
-                    ),
+                        div()
+                            .id("qd-detail")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .p_3()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(car_block)
+                            .child(track_block)
+                            .child(session)
+                            .child(conditions),
+                    )
+                    .child(footer),
             )
     }
 
     fn cars_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let detail = match self.selected_car() {
-            None => div().p_4().text_color(theme::muted()).child("No car selected"),
-            Some(car) => {
-                let mut d = div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
+        let detail =
+            match self.selected_car() {
+                None => div()
                     .p_4()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .when_some(car.badge.clone(), |d, b| d.child(img(b).size(px(40.)).object_fit(ObjectFit::Contain)))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .child(div().text_xl().font_weight(FontWeight::BOLD).child(car.name.clone()))
-                                    .child(div().text_sm().text_color(theme::muted()).child(car.id.clone())),
-                            ),
-                    )
-                    .child(
-                        div().w_full().h(px(260.)).bg(theme::bg()).rounded_sm().overflow_hidden().when_some(
-                            car.skins.get(self.skin).and_then(|s| s.preview.clone()).or(car.preview().map(|p| p.to_path_buf())),
-                            |d, p| d.child(img(p).size_full().object_fit(ObjectFit::Contain)),
-                        ),
+                    .text_color(theme::muted())
+                    .child("No car selected"),
+                Some(car) => {
+                    let dir = car.dir.clone();
+                    let header = div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .when_some(car.badge.clone(), |d, b| {
+                            d.child(
+                                img(b)
+                                    .size(px(40.))
+                                    .flex_shrink_0()
+                                    .object_fit(ObjectFit::Contain),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .text_xl()
+                                        .font_weight(FontWeight::BOLD)
+                                        .truncate()
+                                        .child(car.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme::muted())
+                                        .truncate()
+                                        .child(car.id.clone()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_shrink_0()
+                                .items_center()
+                                .gap_2()
+                                .child(button("open-folder", "Open folder").on_click(
+                                    cx.listener(move |_, _, _, cx| cx.open_with_system(&dir)),
+                                ))
+                                .when(car.has_data_acd && !car.has_data_dir, |d| {
+                                    d.child(
+                                        button("unpack", "Unpack data.acd")
+                                            .on_click(cx.listener(Self::unpack_acd)),
+                                    )
+                                })
+                                .when(car.has_data_dir, |d| {
+                                    d.child(
+                                        button("pack", "Pack data.acd")
+                                            .on_click(cx.listener(Self::pack_acd)),
+                                    )
+                                })
+                                .child(
+                                    primary_button("drive-car", "Drive")
+                                        .on_click(cx.listener(Self::open_quick_drive)),
+                                ),
+                        );
+
+                    let preview = car
+                        .skins
+                        .get(self.skin)
+                        .and_then(|s| s.preview.clone())
+                        .or(car.preview().map(|p| p.to_path_buf()));
+                    let skins = div().flex().flex_wrap().gap_2().children(
+                        car.skins.iter().enumerate().map(|(i, s)| {
+                            let selected = i == self.skin;
+                            div()
+                                .id(("skin", i))
+                                .w(px(112.))
+                                .flex()
+                                .flex_col()
+                                .rounded_sm()
+                                .overflow_hidden()
+                                .border_1()
+                                .border_color(if selected {
+                                    theme::accent()
+                                } else {
+                                    theme::border()
+                                })
+                                .cursor_pointer()
+                                .hover(|d| d.bg(theme::panel_hover()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.skin = i;
+                                    cx.notify();
+                                }))
+                                .child(picture(s.preview.clone(), 63.).w_full())
+                                .child(div().px_1().text_xs().truncate().child(s.name.clone()))
+                        }),
                     );
-                let mut info = panel().flex().flex_col().gap_1();
-                for (k, v) in [("Brand", &car.brand), ("Class", &car.class), ("Year", &car.year), ("Country", &car.country), ("Author", &car.author)] {
-                    if let Some(v) = v {
-                        info = info.child(field(k, v.clone()));
+
+                    let mut info = panel().grid().grid_cols(2).gap_x_6().gap_y_1();
+                    for (k, v) in [
+                        ("Brand", &car.brand),
+                        ("Class", &car.class),
+                        ("Year", &car.year),
+                        ("Country", &car.country),
+                        ("Author", &car.author),
+                    ] {
+                        if let Some(v) = v {
+                            info = info.child(field(k, v.clone()));
+                        }
                     }
-                }
-                for (k, v) in &car.specs {
-                    info = info.child(field(content::spec_label(k).to_owned(), v.clone()));
-                }
-                info = info.child(field(
-                    "Data",
-                    match (car.has_data_acd, car.has_data_dir) {
-                        (true, true) => "data.acd + data folder",
-                        (true, false) => "data.acd (packed)",
-                        (false, true) => "data folder (unpacked)",
-                        (false, false) => "missing",
-                    },
-                ));
-                d = d.child(info);
-                if !car.tags.is_empty() {
-                    d = d.child(div().flex().flex_wrap().gap_1().children(car.tags.iter().map(|t| {
-                        div().px_2().rounded_sm().bg(theme::panel()).text_xs().text_color(theme::muted()).child(t.clone())
-                    })));
-                }
-                if let Some(desc) = &car.description {
-                    d = d.child(div().text_sm().child(desc.clone()));
-                }
-                if let Some(err) = &car.ui_error {
-                    d = d.child(div().text_sm().text_color(theme::error()).child(format!("ui_car.json: {err}")));
-                }
-                let dir = car.dir.clone();
-                d = d.child(
+                    for (k, v) in &car.specs {
+                        info = info.child(field(content::spec_label(k).to_owned(), v.clone()));
+                    }
+                    info = info.child(field(
+                        "Data",
+                        match (car.has_data_acd, car.has_data_dir) {
+                            (true, true) => "data.acd + data folder",
+                            (true, false) => "data.acd (packed)",
+                            (false, true) => "data folder (unpacked)",
+                            (false, false) => "missing",
+                        },
+                    ));
+
                     div()
                         .flex()
-                        .gap_2()
-                        .child(button("open-folder", "Open folder").on_click(cx.listener(move |_, _, _, cx| cx.open_with_system(&dir))))
-                        .when(car.has_data_acd && !car.has_data_dir, |d| {
-                            d.child(button("unpack", "Unpack data.acd").on_click(cx.listener(Self::unpack_acd)))
+                        .flex_col()
+                        .gap_3()
+                        .p_4()
+                        .child(header)
+                        .child(picture(preview, 300.).w_full())
+                        .child(section_title(format!("Skins ({})", car.skins.len())))
+                        .child(skins)
+                        .child(section_title("Specs"))
+                        .child(info)
+                        .when(!car.tags.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .children(car.tags.iter().map(|t| {
+                                        div()
+                                            .px_2()
+                                            .rounded_sm()
+                                            .bg(theme::panel())
+                                            .text_xs()
+                                            .text_color(theme::muted())
+                                            .child(t.clone())
+                                    })),
+                            )
                         })
-                        .when(car.has_data_dir, |d| d.child(button("pack", "Pack data → data.acd").on_click(cx.listener(Self::pack_acd)))),
-                );
-                d = d.child(section_title(format!("Skins ({})", car.skins.len()))).child(
-                    div().flex().flex_wrap().gap_2().children(car.skins.iter().enumerate().map(|(i, s)| {
-                        let selected = i == self.skin;
-                        div()
-                            .id(("skin", i))
-                            .w(px(150.))
-                            .flex()
-                            .flex_col()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(if selected { theme::accent() } else { theme::border() })
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.skin = i;
-                                cx.notify();
-                            }))
-                            .child(div().h(px(84.)).bg(theme::bg()).overflow_hidden().when_some(s.preview.clone(), |d, p| {
-                                d.child(img(p).size_full().object_fit(ObjectFit::Cover))
-                            }))
-                            .child(div().px_1().text_xs().truncate().child(s.name.clone()))
-                    })),
-                );
-                d
-            }
-        };
-        div()
-            .flex()
-            .size_full()
-            .child(self.car_list(cx))
-            .child(div().id("car-detail").flex_1().min_w_0().h_full().overflow_y_scroll().child(detail))
+                        .when_some(car.description.clone(), |d, desc| {
+                            d.child(div().text_sm().child(desc))
+                        })
+                        .when_some(car.ui_error.clone(), |d, err| {
+                            d.child(
+                                div()
+                                    .text_sm()
+                                    .text_color(theme::error())
+                                    .child(format!("ui_car.json: {err}")),
+                            )
+                        })
+                }
+            };
+        div().flex().size_full().child(self.car_list(cx)).child(
+            div()
+                .id("car-detail")
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .overflow_y_scroll()
+                .child(detail),
+        )
     }
 
     fn tracks_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let detail = match self.selected_track() {
-            None => div().p_4().text_color(theme::muted()).child("No track selected"),
-            Some(t) => {
-                let l = &t.layout;
-                let mut info = panel().flex().flex_col().gap_1().child(field("Folder", t.key()));
-                for (k, v) in [("Country", &l.country), ("City", &l.city), ("Length", &l.length.clone().map(|x| format!("{x} m")))] {
-                    if let Some(v) = v {
-                        info = info.child(field(k, v.clone()));
-                    }
-                }
-                if let Some(p) = l.pitboxes {
-                    info = info.child(field("Pit boxes", p.to_string()));
-                }
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
+        let detail =
+            match self.selected_track() {
+                None => div()
                     .p_4()
-                    .child(div().text_xl().font_weight(FontWeight::BOLD).child(l.name.clone()))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_3()
-                            .child(div().flex_1().h(px(300.)).bg(theme::bg()).rounded_sm().overflow_hidden().when_some(l.preview.clone(), |d, p| {
-                                d.child(img(p).size_full().object_fit(ObjectFit::Contain))
-                            }))
-                            .child(div().w(px(260.)).h(px(300.)).when_some(l.outline.clone(), |d, p| {
-                                d.child(img(p).size_full().object_fit(ObjectFit::Contain))
-                            })),
-                    )
-                    .child(info)
-                    .when_some(l.description.clone(), |d, desc| d.child(div().text_sm().child(desc)))
-            }
-        };
-        div()
-            .flex()
-            .size_full()
-            .child(self.track_list(cx))
-            .child(div().id("track-detail").flex_1().min_w_0().h_full().overflow_y_scroll().child(detail))
+                    .text_color(theme::muted())
+                    .child("No track selected"),
+                Some(t) => {
+                    let l = &t.layout;
+                    let mut info = panel()
+                        .grid()
+                        .grid_cols(2)
+                        .gap_x_6()
+                        .gap_y_1()
+                        .child(field("Folder", t.key()));
+                    for (k, v) in [
+                        ("Country", &l.country),
+                        ("City", &l.city),
+                        ("Length", &l.length.clone().map(|x| format!("{x} m"))),
+                    ] {
+                        if let Some(v) = v {
+                            info = info.child(field(k, v.clone()));
+                        }
+                    }
+                    if let Some(p) = l.pitboxes {
+                        info = info.child(field("Pit boxes", p.to_string()));
+                    }
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_4()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_xl()
+                                        .font_weight(FontWeight::BOLD)
+                                        .truncate()
+                                        .child(l.name.clone()),
+                                )
+                                .child(
+                                    primary_button("drive-track", "Drive")
+                                        .on_click(cx.listener(Self::open_quick_drive)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_3()
+                                .child(picture(l.preview.clone(), 240.).flex_1().min_w_0())
+                                .child(picture(l.outline.clone(), 240.).w(px(240.))),
+                        )
+                        .child(info)
+                        .when(!l.tags.is_empty(), |d| {
+                            d.child(div().flex().flex_wrap().gap_1().children(l.tags.iter().map(
+                                |t| {
+                                    div()
+                                        .px_2()
+                                        .rounded_sm()
+                                        .bg(theme::panel())
+                                        .text_xs()
+                                        .text_color(theme::muted())
+                                        .child(t.clone())
+                                },
+                            )))
+                        })
+                        .when_some(l.description.clone(), |d, desc| {
+                            d.child(div().text_sm().child(desc))
+                        })
+                }
+            };
+        div().flex().size_full().child(self.track_list(cx)).child(
+            div()
+                .id("track-detail")
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .overflow_y_scroll()
+                .child(detail),
+        )
     }
 
-    fn install_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// `text_w`: pixel width for wrapping text in the page column (see [`text_w`]).
+    fn install_page(&self, text_w: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        let dest = self
+            .ac_root
+            .as_ref()
+            .map(|r| format!("Installs into {}", r.join("content").display()))
+            .unwrap_or_else(|| "Set the Assetto Corsa folder in Settings first.".into());
         let mut page = div()
             .flex()
             .flex_col()
             .gap_3()
             .p_4()
-            .max_w(px(760.))
+            .w_full()
+            .max_w(px(INSTALL_MAX_W))
             .child(div().text_xl().font_weight(FontWeight::BOLD).child("Install mods"))
-            .child(div().text_sm().text_color(theme::muted()).child(
-                "Pick a .zip with cars or tracks. Folders are detected by ui_car.json / data.acd / ui_track.json, \
+            .child(div().w(px(text_w)).text_sm().text_color(theme::muted()).child(
+                "Pick a .zip with cars or tracks. Folders are found by ui_car.json, data.acd or ui_track.json, \
                  wherever they sit in the archive.",
             ))
-            .child(div().flex().child(button("choose-zip", "Choose archive…").on_click(cx.listener(Self::choose_archive))));
+            .child(div().w(px(text_w)).text_sm().text_color(theme::muted()).child(dest))
+            .child(
+                div().flex().child(
+                    primary_button("choose-zip", "Choose archive…")
+                        .when(self.busy || self.ac_root.is_none(), |d| d.opacity(0.5))
+                        .when(!self.busy && self.ac_root.is_some(), |d| d.on_click(cx.listener(Self::choose_archive))),
+                ),
+            );
         if let Some(state) = &self.install {
-            let mut list = panel().flex().flex_col().gap_1().child(section_title(state.archive.display().to_string()));
+            let name = state
+                .archive
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let mut list = panel()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().font_weight(FontWeight::BOLD).child(name))
+                .child(
+                    div()
+                        .w(px(text_w - PANEL_INSET))
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .child(state.archive.display().to_string()),
+                )
+                .child(section_title(format!("Found {}", state.items.len())));
             for item in &state.items {
                 let kind = match item.kind {
                     install::Kind::Car => "Car",
@@ -962,95 +1578,235 @@ impl CmApp {
                         .flex()
                         .gap_2()
                         .text_sm()
-                        .child(div().w(px(60.)).text_color(theme::muted()).child(kind))
-                        .child(div().flex_1().child(item.id.clone()))
+                        .child(
+                            div()
+                                .w(px(60.))
+                                .flex_shrink_0()
+                                .text_color(theme::muted())
+                                .child(kind),
+                        )
+                        .child(div().flex_1().min_w_0().truncate().child(item.id.clone()))
                         .child(if item.exists {
-                            div().text_color(theme::accent()).child("update (overwrites files)")
+                            div()
+                                .flex_shrink_0()
+                                .text_color(theme::accent())
+                                .child("update, overwrites files")
                         } else {
-                            div().text_color(theme::ok()).child("new")
+                            div().flex_shrink_0().text_color(theme::ok()).child("new")
                         }),
                 );
             }
             page = page.child(list).child(
-                div().flex().child(
-                    primary_button("install", if self.busy { "Installing…" } else { "Install" })
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        primary_button(
+                            "install",
+                            if self.busy {
+                                "Installing…"
+                            } else {
+                                "Install"
+                            },
+                        )
+                        .when(self.busy, |d| d.opacity(0.6))
                         .when(!self.busy, |d| d.on_click(cx.listener(Self::do_install))),
-                ),
+                    )
+                    .when(!self.busy, |d| {
+                        d.child(button("cancel-install", "Cancel").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.install = None;
+                                cx.notify();
+                            },
+                        )))
+                    }),
             );
         }
-        page
+        div()
+            .id("install")
+            .size_full()
+            .overflow_y_scroll()
+            .child(page)
     }
 
-    fn settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let row = |label: &'static str, input: Entity<TextInput>| {
+    fn settings_page(&self, text_w: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        const LABEL_W: f32 = 170.;
+        let label = |text: &'static str| {
+            div()
+                .w(px(LABEL_W))
+                .flex_shrink_0()
+                .text_sm()
+                .text_color(theme::muted())
+                .child(text)
+        };
+        let row = |text: &'static str, control: gpui::AnyElement| {
             div()
                 .flex()
                 .items_center()
                 .gap_3()
-                .child(div().w(px(160.)).flex_shrink_0().text_sm().text_color(theme::muted()).child(label))
-                .child(div().flex_1().child(input))
+                .child(label(text))
+                .child(control)
         };
+        // Label above value so long paths get the whole panel width to wrap in.
+        let info = |text: &'static str, value: String| {
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .child(div().text_xs().text_color(theme::muted()).child(text))
+                .child(div().w(px(text_w - PANEL_INSET)).text_sm().child(value))
+        };
+        let hint = |text: &'static str| {
+            div()
+                .pl(px(LABEL_W + 12.))
+                .text_xs()
+                .text_color(theme::muted())
+                .child(text)
+        };
+
         let race_ini = self
             .ac_root
             .as_ref()
             .and_then(|r| paths::race_ini_path(r))
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "not found (on Linux: run AC from Steam once)".into());
-        div()
-            .id("settings")
-            .size_full()
-            .overflow_y_scroll()
-            .child(
+
+        let game = panel()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(section_title("Game"))
+            .child(row(
+                "Assetto Corsa folder",
                 div()
                     .flex()
-                    .flex_col()
-                    .gap_3()
-                    .p_4()
-                    .max_w(px(820.))
-                    .child(div().text_xl().font_weight(FontWeight::BOLD).child("Settings"))
-                    .child(row("Assetto Corsa folder", self.in_root.clone()))
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .child(grow_input(self.in_root.clone()))
                     .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .pl(px(172.))
-                            .child(button("browse-root", "Browse…").on_click(cx.listener(Self::browse_root)))
-                            .child(button("detect-root", "Auto-detect").on_click(cx.listener(Self::detect_root))),
+                        button("browse-root", "Browse…").on_click(cx.listener(Self::browse_root)),
                     )
-                    .child(row("Driver name", self.in_driver.clone()))
-                    .child(row("Nationality (3 letters)", self.in_nation.clone()))
-                    .when(!cfg!(windows), |d| d.child(row("Proton script", self.in_proton.clone())))
-                    .child(div().flex().pl(px(172.)).child(primary_button("save-settings", "Save").on_click(cx.listener(Self::save_settings))))
-                    .child(section_title("Detected"))
-                    .child(field("race.ini", race_ini))
-                    .when(!cfg!(windows), |d| {
-                        let proton = self
-                            .ac_root
-                            .as_ref()
-                            .and_then(|r| launch::find_proton(r))
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "none found".into());
-                        d.child(field("Proton", proton))
-                    })
-                    .child(field("Settings file", ac_core::settings::path().map(|p| p.display().to_string()).unwrap_or_default())),
-            )
+                    .child(
+                        button("detect-root", "Auto-detect")
+                            .on_click(cx.listener(Self::detect_root)),
+                    )
+                    .into_any_element(),
+            ))
+            .when(!cfg!(windows), |d| {
+                d.child(row(
+                    "Proton script",
+                    grow_input(self.in_proton.clone()).into_any_element(),
+                ))
+                .child(hint(
+                    "Leave empty to use the last Proton recorded in the prefix (shown below).",
+                ))
+            });
+
+        let driver = panel()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(section_title("Driver"))
+            .child(row(
+                "Name",
+                div()
+                    .w(px(280.))
+                    .child(self.in_driver.clone())
+                    .into_any_element(),
+            ))
+            .child(row(
+                "Nationality",
+                div()
+                    .w(px(80.))
+                    .child(self.in_nation.clone())
+                    .into_any_element(),
+            ))
+            .child(hint("Three-letter code, for example ITA, GBR or JOR."));
+
+        let detected = panel()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(section_title("Detected"))
+            .child(info("race.ini", race_ini))
+            .when(!cfg!(windows), |d| {
+                let proton = self
+                    .ac_root
+                    .as_ref()
+                    .and_then(|r| launch::find_proton(r))
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "none found".into());
+                d.child(info("Proton", proton))
+            })
+            .child(info(
+                "Settings file",
+                ac_core::settings::path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            ));
+
+        div().id("settings").size_full().overflow_y_scroll().child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .p_4()
+                .w_full()
+                .max_w(px(SETTINGS_MAX_W))
+                .child(
+                    div()
+                        .text_xl()
+                        .font_weight(FontWeight::BOLD)
+                        .child("Settings"),
+                )
+                .child(game)
+                .child(driver)
+                .child(
+                    div().flex().justify_end().child(
+                        primary_button("save-settings", "Save")
+                            .on_click(cx.listener(Self::save_settings)),
+                    ),
+                )
+                .child(detected),
+        )
     }
 }
 
 impl Render for CmApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let page: gpui::AnyElement = if self.loading {
-            div().p_4().text_color(theme::muted()).child("Loading content…").into_any_element()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let main_w = f32::from(window.viewport_size().width) - SIDEBAR_W;
+        let page: gpui::AnyElement = if self.loading && self.page != Page::Browser {
+            div()
+                .p_4()
+                .text_color(theme::muted())
+                .child("Loading content…")
+                .into_any_element()
         } else {
             match self.page {
                 Page::QuickDrive => self.quick_drive_page(cx).into_any_element(),
                 Page::Cars => self.cars_page(cx).into_any_element(),
                 Page::Tracks => self.tracks_page(cx).into_any_element(),
-                Page::Install => self.install_page(cx).into_any_element(),
-                Page::Settings => self.settings_page(cx).into_any_element(),
+                Page::Install => self
+                    .install_page(text_w(main_w, INSTALL_MAX_W), cx)
+                    .into_any_element(),
+                Page::Browser => div()
+                    .size_full()
+                    .children(self.browser.clone())
+                    .into_any_element(),
+                Page::Settings => self
+                    .settings_page(text_w(main_w, SETTINGS_MAX_W), cx)
+                    .into_any_element(),
             }
         };
-        let status: SharedString = self.status.as_ref().map(|(s, _)| s.clone()).unwrap_or_default().into();
+        let status: SharedString = self
+            .status
+            .as_ref()
+            .map(|(s, _)| s.clone())
+            .unwrap_or_default()
+            .into();
         let status_err = self.status.as_ref().is_some_and(|(_, e)| *e);
 
         div()
@@ -1068,14 +1824,23 @@ impl Render for CmApp {
                         div()
                             .flex()
                             .flex_col()
-                            .w(px(190.))
+                            .w(px(SIDEBAR_W))
                             .flex_shrink_0()
                             .bg(theme::sidebar())
                             .pt_4()
-                            .child(div().px_4().pb_4().text_lg().font_weight(FontWeight::BOLD).text_color(theme::accent()).child("Content Manager"))
+                            .child(
+                                div()
+                                    .px_4()
+                                    .pb_4()
+                                    .text_lg()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(theme::accent())
+                                    .child("Content Manager"),
+                            )
                             .child(self.nav_item(Page::QuickDrive, "Quick Drive", cx))
                             .child(self.nav_item(Page::Cars, "Cars", cx))
                             .child(self.nav_item(Page::Tracks, "Tracks", cx))
+                            .child(self.nav_item(Page::Browser, "Get mods", cx))
                             .child(self.nav_item(Page::Install, "Install mods", cx))
                             .child(self.nav_item(Page::Settings, "Settings", cx)),
                     )
@@ -1091,7 +1856,11 @@ impl Render for CmApp {
                     .border_color(theme::border())
                     .bg(theme::sidebar())
                     .text_xs()
-                    .text_color(if status_err { theme::error() } else { theme::muted() })
+                    .text_color(if status_err {
+                        theme::error()
+                    } else {
+                        theme::muted()
+                    })
                     .child(status),
             )
     }

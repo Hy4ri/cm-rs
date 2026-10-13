@@ -9,6 +9,8 @@ description = "Assetto Corsa content, data.acd, race.ini and launch support"
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
+tempfile.workspace = true
 dirs.workspace = true
 zip.workspace = true
 

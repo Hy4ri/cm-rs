@@ -14,3 +14,8 @@ ac-core = { path = "../ac-core" }
 anyhow.workspace = true
 gpui.workspace = true
 unicode-segmentation.workspace = true
+cef = "=151.3.0"
+# Match the Nix CEF runtime; cef's semver range otherwise selects a newer ABI.
+cef-dll-sys = "=151.3.0"
+dirs.workspace = true
+image = { version = "0.25", default-features = false }

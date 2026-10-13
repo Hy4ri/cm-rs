@@ -1,8 +1,46 @@
 //! Small styled building blocks.
 
-use gpui::{Div, ElementId, FontWeight, SharedString, Stateful, div, prelude::*, px};
+use std::path::PathBuf;
+
+use gpui::{AnyElement, Div, ElementId, FontWeight, ObjectFit, SharedString, Stateful, div, img, prelude::*, px};
 
 use crate::theme;
+
+/// A fixed-height frame that always shows the whole image, centered.
+///
+/// GPUI's `img` derives its size from the image aspect ratio, so a
+/// `size_full` image in a wide box grows taller than the box and the bottom
+/// is clipped. Pinning the image height and capping its width avoids that;
+/// `Contain` letterboxes when the width cap kicks in. Callers set the width.
+pub fn picture(path: Option<PathBuf>, height: f32) -> Div {
+    div()
+        .h(px(height))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .overflow_hidden()
+        .rounded_sm()
+        // Previews carry their own dark backdrop; only empty frames get a fill.
+        .when(path.is_none(), |d| d.bg(theme::bg()))
+        .when_some(path, |d, p| d.child(img(p).h(px(height)).max_w_full().rounded_sm().object_fit(ObjectFit::Contain)))
+}
+
+/// Label column + control, so every setting lines up on the same grid.
+pub fn setting_row(label: impl Into<SharedString>, control: impl IntoElement) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .min_h(px(28.))
+        .child(div().w(px(120.)).flex_shrink_0().text_sm().text_color(theme::muted()).child(label.into()))
+        .child(control)
+}
+
+/// Two or more mutually exclusive chips drawn as one control.
+pub fn segmented(items: Vec<Stateful<Div>>) -> Div {
+    div().flex().gap_1().children(items.into_iter().map(|i| i.into_any_element()).collect::<Vec<AnyElement>>())
+}
 
 pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
     div()
