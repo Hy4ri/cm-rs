@@ -6,6 +6,7 @@
 
 pub mod acd;
 pub mod content;
+pub mod game_cfg;
 pub mod ini;
 pub mod install;
 pub mod json;
