@@ -70,6 +70,11 @@
             cargoBuildFlags = [ "-p" "cm-app" ];
             doCheck = false;
 
+            dontUseCmakeConfigure = true;
+            dontUseNinjaBuild = true;
+            dontUseNinjaInstall = true;
+            dontUseNinjaCheck = true;
+
             nativeBuildInputs = with pkgs; [
               pkg-config
               cmake
