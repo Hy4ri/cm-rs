@@ -11,7 +11,8 @@ use ac_core::settings::Settings;
 use ac_core::{acd, install, launch, paths};
 use gpui::{
     ClickEvent, Context, Div, Entity, FocusHandle, FontWeight, KeyDownEvent, ModifiersChangedEvent,
-    ObjectFit, PathPromptOptions, SharedString, Window, div, img, prelude::*, px, uniform_list,
+    ObjectFit, PathPromptOptions, ScrollStrategy, SharedString, UniformListScrollHandle, Window, div, img,
+    prelude::*, px, uniform_list,
 };
 
 use crate::browser_view::{BrowserView, PreviewDownload};
@@ -30,6 +31,25 @@ enum Page {
     Browser,
     Game,
     Settings,
+}
+
+/// Sidebar order, which L1/R1 on the controller walk through.
+const PAGES: [Page; 7] = [
+    Page::QuickDrive,
+    Page::Cars,
+    Page::Tracks,
+    Page::Browser,
+    Page::Install,
+    Page::Game,
+    Page::Settings,
+];
+
+/// Next list index after moving `delta` rows, clamped; starts at the top with no selection.
+fn step_index(pos: Option<usize>, delta: isize, len: usize) -> usize {
+    match pos {
+        None => 0,
+        Some(p) => (p as isize + delta).clamp(0, len as isize - 1) as usize,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -82,6 +102,13 @@ pub struct CmApp {
     car_filter: Entity<TextInput>,
     track_filter: Entity<TextInput>,
     cars_view: Vec<usize>,
+    car_scroll: UniformListScrollHandle,
+    track_scroll: UniformListScrollHandle,
+    /// Controller navigation task and which Quick Drive list the D-pad drives.
+    pad_nav: Option<gpui::Task<()>>,
+    /// The press that finishes a bind capture is also seen by the nav reader; ignore it until this time.
+    pad_mute_until: Option<std::time::Instant>,
+    pad_tracks: bool,
     car_brand: Option<String>,
     brand_open: bool,
     tracks_view: Vec<usize>,
@@ -306,6 +333,11 @@ impl CmApp {
             car_filter,
             track_filter,
             cars_view: Vec::new(),
+            car_scroll: UniformListScrollHandle::new(),
+            track_scroll: UniformListScrollHandle::new(),
+            pad_nav: None,
+            pad_mute_until: None,
+            pad_tracks: false,
             car_brand: None,
             brand_open: false,
             tracks_view: Vec::new(),
@@ -490,6 +522,13 @@ impl CmApp {
     // ---------- actions ----------
 
     fn go(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.start_game(cx);
+    }
+
+    fn start_game(&mut self, cx: &mut Context<Self>) {
+        if self.game_running {
+            return;
+        }
         let (Some(root), Some(q)) = (self.ac_root.clone(), self.quick_drive(cx)) else {
             return self.set_status("Pick a car and a track first.", true, cx);
         };
@@ -1015,6 +1054,7 @@ impl CmApp {
                         match press {
                             Press::Button(name) => {
                                 this.pad_capturing = None;
+                                this.pad_mute_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(400));
                                 let b = &game_cfg::BINDS[i];
                                 if let Some(c) = this.game_cfg.as_mut() {
                                     c.set_pad(b, Some(name));
@@ -1359,6 +1399,108 @@ impl CmApp {
 
     // ---------- views ----------
 
+    fn goto_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        if page == Page::Browser {
+            self.ensure_browser(window, cx);
+        }
+        if let Some(browser) = &self.browser {
+            browser.update(cx, |browser, cx| browser.set_active(page == Page::Browser, cx));
+        }
+        self.page = page;
+        if page == Page::Game {
+            self.open_game_page(cx);
+        }
+        cx.notify();
+    }
+
+    /// Moves the car or track selection (whichever list the page shows) by `delta` rows.
+    fn pad_move(&mut self, delta: isize) {
+        let tracks = match self.page {
+            Page::Tracks => true,
+            Page::Cars => false,
+            Page::QuickDrive => self.pad_tracks,
+            _ => return,
+        };
+        if tracks {
+            if self.tracks_view.is_empty() {
+                return;
+            }
+            let pos = self.track.and_then(|t| self.tracks_view.iter().position(|&i| i == t));
+            let next = step_index(pos, delta, self.tracks_view.len());
+            self.track = Some(self.tracks_view[next]);
+            self.track_scroll.scroll_to_item(next, ScrollStrategy::Center);
+        } else {
+            if self.cars_view.is_empty() {
+                return;
+            }
+            let pos = self.car.and_then(|c| self.cars_view.iter().position(|&i| i == c));
+            let next = step_index(pos, delta, self.cars_view.len());
+            self.car = Some(self.cars_view[next]);
+            self.skin = 0;
+            self.car_scroll.scroll_to_item(next, ScrollStrategy::Center);
+        }
+    }
+
+    /// One controller press aimed at the launcher UI. Ignored while a bind is
+    /// being captured, the game runs, or the window is in the background.
+    fn pad_press(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let mute = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        if self.pad_capturing.is_some() || self.capturing.is_some() {
+            self.pad_mute_until = Some(mute);
+            return;
+        }
+        if self.pad_mute_until.is_some_and(|t| std::time::Instant::now() < t) {
+            return;
+        }
+        if self.game_running || !window.is_window_active() {
+            return;
+        }
+        let here = PAGES.iter().position(|p| *p == self.page).unwrap_or(0);
+        match name {
+            "LSHOULDER" => self.goto_page(PAGES[(here + PAGES.len() - 1) % PAGES.len()], window, cx),
+            "RSHOULDER" => self.goto_page(PAGES[(here + 1) % PAGES.len()], window, cx),
+            "DPAD_UP" => self.pad_move(-1),
+            "DPAD_DOWN" => self.pad_move(1),
+            "DPAD_LEFT" | "DPAD_RIGHT" if self.page == Page::QuickDrive => {
+                self.pad_tracks = name == "DPAD_RIGHT";
+                let which = if self.pad_tracks { "tracks" } else { "cars" };
+                self.set_status(format!("Controller: D-pad moves the {which} list."), false, cx);
+            }
+            "A" if matches!(self.page, Page::Cars | Page::Tracks) => self.goto_page(Page::QuickDrive, window, cx),
+            "B" if self.page != Page::QuickDrive => self.goto_page(Page::QuickDrive, window, cx),
+            "X" => {
+                let n = self.selected_car().map(|c| c.skins.len()).unwrap_or(0);
+                if n > 0 {
+                    self.skin = (self.skin + 1) % n;
+                }
+            }
+            "START" if matches!(self.page, Page::QuickDrive | Page::Cars | Page::Tracks) => self.start_game(cx),
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn start_pad_nav(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use ac_core::gamepad::{Press, Reader};
+        self.pad_nav = Some(cx.spawn_in(window, async move |this, cx| {
+            let mut reader: Option<Reader> = None;
+            let mut ticks = 0u32;
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(16)).await;
+                // Reopen every ~5 s so a pad that connects or reconnects is picked up.
+                if ticks % 312 == 0 {
+                    reader = Reader::open().ok();
+                }
+                ticks = ticks.wrapping_add(1);
+                let Some(Press::Button(name)) = reader.as_mut().and_then(|r| r.poll()) else { continue };
+                if this.update_in(cx, |this, window, cx| this.pad_press(name, window, cx)).is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+
     fn nav_item(
         &self,
         page: Page,
@@ -1383,21 +1525,7 @@ impl CmApp {
                     .text_color(theme::muted())
                     .hover(|s| s.text_color(theme::text()))
             })
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if page == Page::Browser {
-                    this.ensure_browser(window, cx);
-                }
-                if let Some(browser) = &this.browser {
-                    browser.update(cx, |browser, cx| {
-                        browser.set_active(page == Page::Browser, cx)
-                    });
-                }
-                this.page = page;
-                if page == Page::Game {
-                    this.open_game_page(cx);
-                }
-                cx.notify();
-            }))
+            .on_click(cx.listener(move |this, _, window, cx| this.goto_page(page, window, cx)))
             .child(label)
     }
 
@@ -1521,6 +1649,7 @@ impl CmApp {
                     .collect()
             }),
         )
+        .track_scroll(self.car_scroll.clone())
         .flex_1();
         let header = self.brand_header(cx);
         self.list_column(CAR_LIST_W, self.car_filter.clone(), counter, Some(header), list)
@@ -1563,6 +1692,7 @@ impl CmApp {
                     .collect()
             }),
         )
+        .track_scroll(self.track_scroll.clone())
         .flex_1();
         self.list_column(TRACK_LIST_W, self.track_filter.clone(), counter, None, list)
     }

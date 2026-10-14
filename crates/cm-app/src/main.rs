@@ -71,7 +71,17 @@ fn main() {
                 app_id: Some("cm-rs".into()),
                 ..Default::default()
             },
-            |_, cx| cx.new(app::CmApp::new),
+            |window, cx| {
+                cx.new(|cx| {
+                    #[allow(unused_mut)]
+                    let mut app = app::CmApp::new(cx);
+                    #[cfg(target_os = "linux")]
+                    app.start_pad_nav(window, cx);
+                    #[cfg(not(target_os = "linux"))]
+                    let _ = window;
+                    app
+                })
+            },
         )
         .expect("failed to open window");
         cx.activate(true);
