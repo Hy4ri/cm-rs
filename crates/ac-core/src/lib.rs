@@ -7,6 +7,8 @@
 pub mod acd;
 pub mod content;
 pub mod game_cfg;
+#[cfg(target_os = "linux")]
+pub mod gamepad;
 pub mod ini;
 pub mod install;
 pub mod json;
