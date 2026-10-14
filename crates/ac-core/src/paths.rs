@@ -77,6 +77,44 @@ pub fn steam_libraries() -> Vec<PathBuf> {
     libs
 }
 
+/// Directories holding only Steam's `libSDL2-2.0.so.0` (64- and 32-bit), which
+/// Wine's gamepad bus needs and `steam-run` doesn't provide. Only SDL2 is
+/// exposed: the rest of Steam's runtime (FreeType, libattr, libselinux) is too
+/// old and breaks Wine and `steam-run`'s bwrap. Symlinks live in the cache dir.
+pub fn steam_sdl_lib_dirs() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    return Vec::new();
+    #[cfg(not(windows))]
+    {
+        let Some(stage) = dirs::cache_dir().map(|d| d.join("cm-rs").join("steam-sdl")) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (arch, sub) in [("x86_64-linux-gnu", "64"), ("i386-linux-gnu", "32")] {
+            let Some(src) = steam_roots()
+                .into_iter()
+                .map(|r| r.join("ubuntu12_32/steam-runtime/usr/lib").join(arch))
+                .find(|p| p.join("libSDL2-2.0.so.0").exists())
+            else {
+                continue;
+            };
+            let dst = stage.join(sub);
+            if fs::create_dir_all(&dst).is_err() {
+                continue;
+            }
+            for name in ["libSDL2-2.0.so.0"] {
+                let link = dst.join(name);
+                let _ = fs::remove_file(&link);
+                if std::os::unix::fs::symlink(src.join(name), &link).is_err() {
+                    continue;
+                }
+            }
+            out.push(dst);
+        }
+        out
+    }
+}
+
 /// Extracts `"path" "..."` values from `libraryfolders.vdf`.
 pub fn parse_library_paths(vdf: &str) -> Vec<PathBuf> {
     vdf.lines()

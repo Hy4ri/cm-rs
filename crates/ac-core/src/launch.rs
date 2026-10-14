@@ -59,6 +59,19 @@ pub fn start(ac_root: &Path, opts: &LaunchOptions) -> Result<Child> {
         c.env("STEAM_COMPAT_DATA_PATH", compat)
             .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", steam_root)
             .env("STEAM_COMPAT_APP_ID", &app_id);
+
+        let sdl_dirs = paths::steam_sdl_lib_dirs();
+        if let Ok(joined) = std::env::join_paths(&sdl_dirs) {
+            if !joined.is_empty() {
+                c.env("LD_LIBRARY_PATH", joined);
+            }
+        }
+        if std::env::var_os("PROTON_DISABLE_HIDRAW").is_none() {
+            c.env(
+                "PROTON_DISABLE_HIDRAW",
+                "0x054C/0x05C4,0x054C/0x09CC,0x054C/0x0BA0,0x054C/0x0CE6,0x0DF2,0x057E/0x2009",
+            );
+        }
         c
     };
     cmd.current_dir(ac_root).env("SteamAppId", &app_id).env("SteamGameId", &app_id);
