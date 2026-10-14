@@ -5,12 +5,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ac_core::content::{self, Car, TrackEntry, Weather};
+use ac_core::game_cfg::{self, GameConfig, Kind, Setting, Tab};
 use ac_core::race::{self, Conditions, Mode, QuickDrive};
 use ac_core::settings::Settings;
 use ac_core::{acd, install, launch, paths};
 use gpui::{
-    ClickEvent, Context, Div, Entity, FontWeight, ObjectFit, PathPromptOptions, SharedString,
-    Window, div, img, prelude::*, px, uniform_list,
+    ClickEvent, Context, Div, Entity, FocusHandle, FontWeight, KeyDownEvent, ModifiersChangedEvent,
+    ObjectFit, PathPromptOptions, SharedString, Window, div, img, prelude::*, px, uniform_list,
 };
 
 use crate::browser_view::{BrowserView, PreviewDownload};
@@ -27,6 +28,7 @@ enum Page {
     Tracks,
     Install,
     Browser,
+    Game,
     Settings,
 }
 
@@ -103,6 +105,17 @@ pub struct CmApp {
     in_driver: Entity<TextInput>,
     in_nation: Entity<TextInput>,
     in_proton: Entity<TextInput>,
+
+    game_cfg: Option<GameConfig>,
+    game_error: Option<String>,
+    game_tab: Tab,
+    game_settings: Vec<Setting>,
+    /// Index into [`game_cfg::BINDS`] waiting for a key press.
+    capturing: Option<usize>,
+    capture_focus: FocusHandle,
+    /// Index into [`game_cfg::BINDS`] waiting for a controller button, and the task reading it.
+    pad_capturing: Option<usize>,
+    pad_task: Option<gpui::Task<()>>,
 }
 
 const SIDEBAR_W: f32 = 190.;
@@ -306,6 +319,14 @@ impl CmApp {
             in_driver,
             in_nation,
             in_proton,
+            game_cfg: None,
+            game_error: None,
+            game_tab: Tab::Video,
+            game_settings: game_cfg::settings(),
+            capturing: None,
+            capture_focus: cx.focus_handle(),
+            pad_capturing: None,
+            pad_task: None,
         };
         if this.ac_root.is_none() {
             this.status = Some((
@@ -527,6 +548,9 @@ impl CmApp {
         }
         let changed = self.ac_root.as_ref() != Some(&root);
         self.ac_root = Some(root);
+        if changed {
+            self.game_cfg = None;
+        }
         self.set_status("Settings saved.", false, cx);
         if changed {
             self.reload(cx);
@@ -746,6 +770,575 @@ impl CmApp {
         }
     }
 
+    // ---------- game settings ----------
+
+    /// Loads the cfg files the first time the page opens (and after the AC folder changes).
+    fn open_game_page(&mut self, cx: &mut Context<Self>) {
+        if self.game_cfg.is_some() {
+            return;
+        }
+        let Some(root) = self.ac_root.clone() else {
+            self.game_error = Some("Set the Assetto Corsa folder in Settings first.".into());
+            return;
+        };
+        match GameConfig::load(&root) {
+            Ok(c) => {
+                self.game_cfg = Some(c);
+                self.game_error = None;
+            }
+            Err(e) => self.game_error = Some(format!("{e:#}")),
+        }
+        cx.notify();
+    }
+
+    fn save_game(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = self.game_cfg.as_mut() else {
+            return;
+        };
+        match c.save() {
+            Ok(files) if files.is_empty() => self.set_status("Nothing to save.", false, cx),
+            Ok(files) => {
+                let note = if self.game_running {
+                    " Restart the game to apply."
+                } else {
+                    ""
+                };
+                self.set_status(format!("Saved {}.{note}", files.join(", ")), false, cx)
+            }
+            Err(e) => self.set_status(format!("Couldn't save game settings: {e:#}"), true, cx),
+        }
+    }
+
+    fn revert_game(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.game_cfg = None;
+        self.capturing = None;
+        self.open_game_page(cx);
+        self.set_status("Reverted to the saved game settings.", false, cx);
+    }
+
+    fn assign_key(&mut self, vk: Option<u32>, cx: &mut Context<Self>) {
+        let (Some(i), Some(c)) = (self.capturing.take(), self.game_cfg.as_mut()) else {
+            return;
+        };
+        let bind = &game_cfg::BINDS[i];
+        c.set_bind(bind, vk);
+        let conflicts = c.conflicts(bind);
+        if !conflicts.is_empty() {
+            self.status = Some((
+                format!(
+                    "{} shares its key with {}.",
+                    bind.label,
+                    conflicts.join(", ")
+                ),
+                true,
+            ));
+        }
+        cx.notify();
+    }
+
+    fn capture_key(&mut self, e: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.capturing.is_none() {
+            return;
+        }
+        cx.stop_propagation();
+        if e.keystroke.key == "escape" {
+            self.capturing = None;
+            return cx.notify();
+        }
+        match game_cfg::vk_from_key(&e.keystroke.key) {
+            Some(vk) => self.assign_key(Some(vk), cx),
+            None => self.set_status(
+                format!("AC can't bind “{}”; try another key.", e.keystroke.key),
+                true,
+                cx,
+            ),
+        }
+    }
+
+    /// Modifier keys arrive as modifier changes, not key presses. AC wants the
+    /// left/right variant; GPUI doesn't say which side, so the left one is used.
+    fn capture_modifier(
+        &mut self,
+        e: &ModifiersChangedEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.capturing.is_none() {
+            return;
+        }
+        let m = e.modifiers;
+        let vk = if m.control {
+            0xA2
+        } else if m.shift {
+            0xA0
+        } else if m.alt {
+            0xA4
+        } else {
+            return;
+        };
+        self.assign_key(Some(vk), cx);
+    }
+
+    fn game_control(
+        &self,
+        idx: usize,
+        s: &Setting,
+        c: &GameConfig,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let value = c.get(s.file, s.section, s.key).unwrap_or("").to_owned();
+        let base = idx * 100;
+        fn set(
+            idx: usize,
+            v: String,
+            cx: &mut Context<CmApp>,
+        ) -> impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static {
+            cx.listener(move |this, _, _, cx| {
+                let s = &this.game_settings[idx];
+                let (file, section, key) = (s.file, s.section, s.key);
+                if let Some(c) = this.game_cfg.as_mut() {
+                    c.set(file, section, key, &v);
+                }
+                cx.notify();
+            })
+        }
+        match &s.kind {
+            Kind::Toggle => {
+                let on = value.trim() != "0" && !value.is_empty();
+                segmented(vec![
+                    chip(("gs", base), "On", on).on_click(set(idx, "1".into(), cx)),
+                    chip(("gs", base + 1), "Off", !on).on_click(set(idx, "0".into(), cx)),
+                ])
+                .into_any_element()
+            }
+            Kind::Choice(opts) => {
+                let known = opts.iter().any(|(v, _)| *v == value);
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1()
+                    .children(opts.iter().enumerate().map(|(j, (v, label))| {
+                        chip(("gs", base + j), *label, *v == value).on_click(set(
+                            idx,
+                            (*v).to_owned(),
+                            cx,
+                        ))
+                    }))
+                    .when(!known && !value.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .child(format!("current: {value}")),
+                        )
+                    })
+                    .into_any_element()
+            }
+            Kind::Filter => {
+                div()
+                    .flex()
+                    .flex_1()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(c.filters.iter().enumerate().map(|(j, f)| {
+                        chip(("gs", base + j), f.clone(), f.eq_ignore_ascii_case(&value))
+                            .on_click(set(idx, f.clone(), cx))
+                    }))
+                    .into_any_element()
+            }
+            Kind::Number { scale, suffix, .. } => {
+                let shown = format!("{}{suffix}", game_cfg::fmt_number(c.number(s) * scale));
+                fn step(
+                    idx: usize,
+                    d: i32,
+                    cx: &mut Context<CmApp>,
+                ) -> impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static {
+                    cx.listener(move |this, _, _, cx| {
+                        let s = this.game_settings[idx].clone();
+                        if let Some(c) = this.game_cfg.as_mut() {
+                            c.step(&s, d);
+                        }
+                        cx.notify();
+                    })
+                }
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(button(("gs", base), "−").on_click(step(idx, -1, cx)))
+                    .child(div().w(px(96.)).text_center().text_sm().child(shown))
+                    .child(button(("gs", base + 1), "+").on_click(step(idx, 1, cx)))
+                    .into_any_element()
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_pad_capture(&mut self, i: usize, cx: &mut Context<Self>) {
+        use ac_core::gamepad::{Press, Reader};
+        self.capturing = None;
+        let mut reader = match Reader::open() {
+            Ok(r) => r,
+            Err(e) => return self.set_status(format!("{e:#}"), true, cx),
+        };
+        self.pad_capturing = Some(i);
+        self.status = Some((format!("Listening on {}…", reader.names.join(", ")), false));
+        cx.notify();
+        self.pad_task = Some(cx.spawn(async move |this, cx| {
+            for _ in 0..(15_000 / 16) {
+                cx.background_executor().timer(std::time::Duration::from_millis(16)).await;
+                let Some(press) = reader.poll() else { continue };
+                let done = this
+                    .update(cx, |this, cx| {
+                        if this.pad_capturing != Some(i) {
+                            return true;
+                        }
+                        match press {
+                            Press::Button(name) => {
+                                this.pad_capturing = None;
+                                let b = &game_cfg::BINDS[i];
+                                if let Some(c) = this.game_cfg.as_mut() {
+                                    c.set_pad(b, Some(name));
+                                    let others = c.pad_conflicts(b);
+                                    this.status = Some(if others.is_empty() {
+                                        (format!("{} → {}", b.label, game_cfg::pad_label(name)), false)
+                                    } else {
+                                        (format!("{} shares {} with {}.", b.label, game_cfg::pad_label(name), others.join(", ")), true)
+                                    });
+                                }
+                                cx.notify();
+                                true
+                            }
+                            Press::Unbindable(_) => {
+                                this.set_status("AC can't bind that button (L2/R2 are brake/throttle). Try another.", true, cx);
+                                false
+                            }
+                        }
+                    })
+                    .unwrap_or(true);
+                if done {
+                    return;
+                }
+            }
+            this.update(cx, |this, cx| {
+                if this.pad_capturing == Some(i) {
+                    this.pad_capturing = None;
+                    this.set_status("No button pressed.", true, cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn start_pad_capture(&mut self, _: usize, cx: &mut Context<Self>) {
+        self.set_status("Controller capture is Linux-only for now.", true, cx);
+    }
+
+    fn keybinds(&self, c: &GameConfig, cx: &mut Context<Self>) -> Vec<Div> {
+        let mut panels: Vec<Div> = Vec::new();
+        let mut current = "";
+        for (i, b) in game_cfg::BINDS.iter().enumerate() {
+            if b.group != current {
+                current = b.group;
+                panels.push(
+                    panel()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(section_title(b.group)),
+                );
+            }
+            let capturing = self.capturing == Some(i);
+            let bound = c.bind(b);
+            let label = if capturing {
+                "Press a key… (Esc cancels)".to_string()
+            } else {
+                bound.map(game_cfg::vk_name).unwrap_or_else(|| "—".into())
+            };
+            let mut conflicts = c.conflicts(b);
+            conflicts.extend(c.pad_conflicts(b));
+            let pad_capturing = self.pad_capturing == Some(i);
+            let pad = c.pad(b);
+            let pad_cell = match b.pad_axis() {
+                Some(axis) => div()
+                    .w(px(200.))
+                    .px_3()
+                    .text_sm()
+                    .text_color(theme::muted())
+                    .child(format!("{axis} (automatic)"))
+                    .into_any_element(),
+                None => div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id(("pad", i))
+                            .w(px(140.))
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .border_1()
+                            .text_sm()
+                            .cursor_pointer()
+                            .when(pad_capturing, |d| {
+                                d.border_color(theme::accent()).text_color(theme::accent())
+                            })
+                            .when(!pad_capturing, |d| {
+                                d.border_color(theme::border())
+                                    .bg(theme::panel())
+                                    .hover(|s| s.bg(theme::panel_hover()))
+                            })
+                            .when(pad.is_none() && !pad_capturing, |d| {
+                                d.text_color(theme::muted())
+                            })
+                            .child(if pad_capturing {
+                                "Press a button…".to_string()
+                            } else {
+                                pad.map(|p| game_cfg::pad_label(p).to_owned())
+                                    .unwrap_or_else(|| "—".into())
+                            })
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.start_pad_capture(i, cx)),
+                            ),
+                    )
+                    .when(pad.is_some(), |d| {
+                        d.child(button(("unpad", i), "Clear").on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                if let Some(c) = this.game_cfg.as_mut() {
+                                    c.set_pad(&game_cfg::BINDS[i], None);
+                                }
+                                cx.notify();
+                            },
+                        )))
+                    })
+                    .into_any_element(),
+            };
+            let key_button = div()
+                .id(("bind", i))
+                .w(px(200.))
+                .px_3()
+                .py_1()
+                .rounded_sm()
+                .border_1()
+                .text_sm()
+                .cursor_pointer()
+                .when(capturing, |d| {
+                    d.border_color(theme::accent()).text_color(theme::accent())
+                })
+                .when(!capturing, |d| {
+                    d.border_color(theme::border())
+                        .bg(theme::panel())
+                        .hover(|s| s.bg(theme::panel_hover()))
+                })
+                .when(bound.is_none() && !capturing, |d| {
+                    d.text_color(theme::muted())
+                })
+                .child(label)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.capturing = Some(i);
+                    this.pad_capturing = None;
+                    this.pad_task = None;
+                    window.focus(&this.capture_focus);
+                    cx.notify();
+                }));
+            let row = div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .min_h(px(28.))
+                .child(
+                    div()
+                        .w(px(170.))
+                        .flex_shrink_0()
+                        .text_sm()
+                        .text_color(theme::muted())
+                        .child(b.label),
+                )
+                .child(key_button)
+                .child(div().w(px(56.)).flex_shrink_0().child(if bound.is_some() {
+                    button(("unbind", i), "Clear")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.capturing = Some(i);
+                            this.assign_key(None, cx);
+                        }))
+                        .into_any_element()
+                } else {
+                    div().into_any_element()
+                }))
+                .child(pad_cell)
+                .when(!conflicts.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::error())
+                            .child(format!("also {}", conflicts.join(", "))),
+                    )
+                });
+            let last = panels.pop().unwrap();
+            panels.push(last.child(row));
+        }
+        panels
+    }
+
+    fn game_page(&self, text_w: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(c) = self.game_cfg.as_ref() else {
+            let msg = self.game_error.clone().unwrap_or_else(|| "Loading…".into());
+            return div()
+                .id("game")
+                .p_4()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xl()
+                        .font_weight(FontWeight::BOLD)
+                        .child("Game settings"),
+                )
+                .child(div().text_sm().text_color(theme::error()).child(msg));
+        };
+
+        let tabs = segmented(
+            Tab::ALL
+                .iter()
+                .map(|&t| {
+                    chip(t.label(), t.label(), self.game_tab == t).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.game_tab = t;
+                            this.capturing = None;
+                            this.pad_capturing = None;
+                            this.pad_task = None;
+                            cx.notify();
+                        },
+                    ))
+                })
+                .collect(),
+        );
+
+        let mut panels: Vec<Div> = Vec::new();
+        let mut current = "";
+        for (idx, s) in self
+            .game_settings
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.tab == self.game_tab)
+        {
+            if s.group != current {
+                current = s.group;
+                panels.push(
+                    panel()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(section_title(s.group)),
+                );
+            }
+            let row = div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .min_h(px(28.))
+                .child(
+                    div()
+                        .w(px(170.))
+                        .flex_shrink_0()
+                        .text_sm()
+                        .text_color(theme::muted())
+                        .child(s.label),
+                )
+                .child(self.game_control(idx, s, c, cx));
+            let last = panels.pop().unwrap();
+            panels.push(last.child(row));
+        }
+        if self.game_tab == Tab::Keys {
+            panels.push(
+                panel().child(
+                    div()
+                        .w(px(text_w - PANEL_INSET))
+                        .text_sm()
+                        .text_color(theme::muted())
+                        .child(
+                            "Keyboard: click a key, then press the new one (Esc cancels; Ctrl, Shift and Alt bind as the \
+                             left-hand key). Controller: click its column, then press the button. Set Input method to \
+                             Gamepad on the Controls tab to drive with it.",
+                        ),
+                ),
+            );
+            panels.extend(self.keybinds(c, cx));
+        }
+
+        let dirty = c.dirty_files();
+        let footer = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .py_2()
+            .border_t_1()
+            .border_color(theme::border())
+            .bg(theme::sidebar())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .text_color(theme::muted())
+                    .truncate()
+                    .child(if dirty.is_empty() {
+                        format!("Saved in {}", c.dir.display())
+                    } else {
+                        format!("Unsaved: {}", dirty.join(", "))
+                    }),
+            )
+            .when(!dirty.is_empty(), |d| {
+                d.child(button("game-revert", "Revert").on_click(cx.listener(Self::revert_game)))
+            })
+            .child(
+                primary_button("game-save", "Save")
+                    .when(dirty.is_empty(), |d| d.opacity(0.5))
+                    .when(!dirty.is_empty(), |d| {
+                        d.on_click(cx.listener(Self::save_game))
+                    }),
+            );
+
+        div()
+            .id("game")
+            .track_focus(&self.capture_focus)
+            .on_key_down(cx.listener(Self::capture_key))
+            .on_modifiers_changed(cx.listener(Self::capture_modifier))
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(
+                div()
+                    .id("game-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .p_4()
+                            .w_full()
+                            .max_w(px(SETTINGS_MAX_W))
+                            .child(
+                                div()
+                                    .text_xl()
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("Game settings"),
+                            )
+                            .child(tabs)
+                            .children(panels),
+                    ),
+            )
+            .child(footer)
+    }
+
     // ---------- views ----------
 
     fn nav_item(
@@ -782,6 +1375,9 @@ impl CmApp {
                     });
                 }
                 this.page = page;
+                if page == Page::Game {
+                    this.open_game_page(cx);
+                }
                 cx.notify();
             }))
             .child(label)
@@ -1796,6 +2392,9 @@ impl Render for CmApp {
                     .size_full()
                     .children(self.browser.clone())
                     .into_any_element(),
+                Page::Game => self
+                    .game_page(text_w(main_w, SETTINGS_MAX_W), cx)
+                    .into_any_element(),
                 Page::Settings => self
                     .settings_page(text_w(main_w, SETTINGS_MAX_W), cx)
                     .into_any_element(),
@@ -1842,6 +2441,7 @@ impl Render for CmApp {
                             .child(self.nav_item(Page::Tracks, "Tracks", cx))
                             .child(self.nav_item(Page::Browser, "Get mods", cx))
                             .child(self.nav_item(Page::Install, "Install mods", cx))
+                            .child(self.nav_item(Page::Game, "Game settings", cx))
                             .child(self.nav_item(Page::Settings, "Settings", cx)),
                     )
                     .child(div().flex_1().min_w_0().h_full().child(page)),
