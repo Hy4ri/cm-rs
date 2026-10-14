@@ -1,123 +1,149 @@
-# cm-rs: Content Manager for Assetto Corsa, in Rust
+# content-manager-linux (`cm-rs`)
 
-A native rewrite of [Content Manager](https://github.com/gro-ove/actools) using
-[GPUI](https://gpui.rs) (Zed's UI framework). It runs natively on Linux and
-Windows. On Linux it launches the game through Proton.
+A native rewrite of [Content Manager](https://github.com/gro-ove/actools) for Assetto Corsa in Rust using [GPUI](https://gpui.rs) (Zed's GPU-accelerated UI framework).
 
-## What works (v0.1)
+It runs natively on Linux (and Windows), launching `acs.exe` through Proton with proper Steam runtime container integration and controller support.
 
-- **Quick Drive**: pick car, skin, track and layout; Practice, Hotlap, or Quick Race
-  against AI (laps, opponent count, AI strength, grid slot); time of day,
-  temperature (with CM's road-temperature model), weather, penalties. Writes
-  `race.ini` and starts `acs.exe`.
-- **Cars**: list and search, previews, specs, tags, description, skins; unpack
-  `data.acd` → `data/` and pack `data/` → `data.acd` (the old file is backed up).
-- **Tracks**: every layout with preview, outline, length, pit boxes.
-- **Get mods**: browse websites inside the app with CEF/Chromium, including
-  persistent browser sessions, navigation controls and native downloads. Completed
-  downloads offer **Preview**; installation always requires your click.
-- **Install mods**: drop in a `.zip`; cars and tracks are detected anywhere in the
-  archive and extracted to `content/`.
-- **Settings**: game folder (auto-detected from Steam libraries), driver name,
-  nationality, Proton override.
-- **CLI**: `cm-rs acd unpack|pack`, `cm-rs list cars|tracks`,
-  `cm-rs install mod.zip`, `cm-rs where`.
+![Quick Drive](docs/screenshots/quick-drive.png)
 
-Not yet: online server browser, CSP/Sol settings, replays, showroom/3D preview,
-championships, 7z/rar archives, setups, controls editor.
+---
 
-## Linux
+## Screenshots
 
-1. In Steam, set Assetto Corsa to use Proton (Proton-GE 9-20 or newer works
-   best) and launch it once so Steam creates the Proton prefix
-   (`steamapps/compatdata/244210`).
-2. Install build dependencies (Debian/Ubuntu names):
+| Cars & Liveries | Track Layouts |
+| :---: | :---: |
+| ![Cars](docs/screenshots/cars.png) | ![Tracks](docs/screenshots/tracks.png) |
 
-   ```sh
-   sudo apt install build-essential pkg-config libxkbcommon-x11-dev libwayland-dev \
-       libx11-xcb-dev libfontconfig-dev libvulkan1 mesa-vulkan-drivers
-   ```
+| Career Mode | Special Events |
+| :---: | :---: |
+| ![Career](docs/screenshots/career.png) | ![Special Events](docs/screenshots/special-events.png) |
 
-   Fedora: `gcc pkgconf libxkbcommon-x11-devel wayland-devel libxcb-devel fontconfig-devel vulkan-loader`.
-   Arch: `base-devel libxkbcommon-x11 wayland libxcb fontconfig vulkan-icd-loader`.
-3. Install Rust (https://rustup.rs) and build:
+---
 
-   ```sh
-   cargo build --release
-   ./target/release/cm-rs
-   ```
+## Features
 
-Steam must be running when you press **Go**. The app writes `race.ini` into the
-Proton prefix (`.../pfx/drive_c/users/steamuser/Documents/Assetto Corsa/cfg`)
-and runs `proton run acs.exe` with the Steam compat variables set. When
-`steam-run` is available on PATH, the app launches Proton inside that runtime
-and removes the GUI's inherited library overrides. On NixOS, `steam-run` is
-required alongside Steam; bare Proton can hang without creating a game window.
-This is the Steam runtime wrapper, not SteamCMD or `steam -applaunch` (which
-starts Kunos' launcher rather than the prepared Quick Drive session).
-The Proton build is taken from the prefix's `config_info`, which records the
-last used build, not necessarily the current Steam compatibility selection.
-If absent, detection falls back to the alphabetically last installed Proton
-path. You can override it in Settings. `cm-rs where` prints detected paths.
+- **Quick Drive**: Pick car, skin, track, and layout. Practice, Hotlap, or Quick Race against AI (configurable laps, opponent count, AI strength, and starting grid slot). Controls for time of day, ambient temperature (using Content Manager's road temperature model), weather presets, and track penalties. Prepares `race.ini` and launches `acs.exe`.
+- **Cars**: Filter and search across car models and brands. Detailed specs, badges, descriptions, and skin/livery picker. Unpack encrypted `data.acd` to `data/` and pack edited `data/` back into `data.acd` (with automated backups).
+- **Tracks**: Full track and layout browser with map previews, track outlines, length, and pit box capacity.
+- **Career & Special Events**: Full career mode series progression, series unlock criteria, AI opponent setups, championship points, medal targets (Gold/Silver/Bronze), and personal record tracking.
+- **Embedded Mod Browser (Get mods)**: Integrated CEF/Chromium browser with persistent browsing sessions, bookmarks, and direct mod download capture.
+- **Mod Installer**: Drag-and-drop or file pick `.zip` archives. Automatically detects car and track structures and extracts them cleanly into your Assetto Corsa directory.
+- **In-Game Settings**: Video, audio, UI, and input configuration with gamepad bind capture and direct AC INI editing.
+- **Gamepad Navigation**: Drive launcher navigation with controller buttons and d-pad.
+- **CLI Tools**: Scriptable terminal utilities for headless tasks (`cm-rs list cars|tracks|events`, `cm-rs acd unpack|pack`, `cm-rs install`, `cm-rs where`).
 
-### Embedded mod browser (Linux/NixOS)
+---
 
-The Nix development shell supplies the CEF runtime matching the pinned Rust
-bindings and keeps GPUI's Vulkan loader ahead of browser libraries:
+## Getting Started (Linux)
 
+### 1. Steam & Proton Setup
+1. In Steam, enable Proton for Assetto Corsa (Proton-GE 9-20 or newer is recommended).
+2. Launch the game once from Steam so it generates the Proton prefix directory (`steamapps/compatdata/244210`).
+
+### 2. Nix / NixOS (Recommended)
+
+Run directly via the development shell:
 ```sh
 nix develop path:. -c cargo run --release -p cm-app
 ```
 
-Open **Get mods**, browse to a mod site, then use **Preview** on a completed
-ZIP download and **Install** on the detected-content preview. Cancelled or
-interrupted downloads are not installable. Downloads and the browser profile
-live under the platform/XDG cache directory in `cm-rs/browser/`.
+Or build the standalone package and desktop launcher:
+```sh
+nix build path:.
+./result/bin/cm-rs
+```
 
-For a custom runtime, set `CM_RS_CEF_PATH` to the flattened CEF resource/library
-directory; `CEF_PATH` is also required at build time. Keep the runtime version
-aligned with `cef` and `cef-dll-sys`. Chromium sandboxing and certificate checks
-remain enabled. Login is performed in the browser; websites receive no direct
-installer API. The existing installer supports ZIP cars/tracks, not 7z/RAR.
+### 3. Native Build (Arch / Debian / Ubuntu / Fedora)
 
-The browser has been exercised on native Wayland in NixOS; Windows browser
-integration, complex IME composition and HiDPI remain unverified.
+Install the required build dependencies:
 
-### App configuration
+- **Debian / Ubuntu**:
+  ```sh
+  sudo apt install build-essential pkg-config cmake ninja-build \
+      libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev \
+      libfontconfig-dev libvulkan1 mesa-vulkan-drivers
+  ```
+- **Arch**:
+  ```sh
+  sudo pacman -S base-devel cmake ninja pkgconf libxkbcommon-x11 wayland libxcb fontconfig vulkan-icd-loader
+  ```
+- **Fedora**:
+  ```sh
+  sudo dnf install gcc gcc-c++ cmake ninja-build pkgconf \
+      libxkbcommon-x11-devel wayland-devel libxcb-devel \
+      fontconfig-devel vulkan-loader
+  ```
 
-App settings and the last Quick Drive session live in
-`~/.config/cm-rs/settings.toml` (or the platform/XDG config directory).
-Existing `settings.json` is migrated automatically on first load; the original
-JSON is retained unchanged as a backup. TOML takes precedence once present.
-Invalid TOML reports an error rather than silently resetting or overwriting it.
-Writes replace the file atomically. Edit it while the app is closed; saves
-normalize formatting and do not preserve comments. Assetto Corsa's own INI
-files and car/track metadata JSON keep their required game formats.
+Build with Rust (1.80+):
+```sh
+cargo build --release -p cm-app
+./target/release/cm-rs
+```
 
-Flatpak Steam: detection covers `~/.var/app/com.valvesoftware.Steam`, but
-running Proton from outside the Flatpak sandbox may not work. Native Steam is
-recommended.
+---
 
-## Windows
+## Proton Launching & Gamepad Details
 
-Install Rust and the Visual Studio C++ Build Tools, then `cargo build --release`.
+When you hit **Go!**, the launcher writes `race.ini` into your Proton prefix (`.../pfx/drive_c/users/steamuser/Documents/Assetto Corsa/cfg`) and launches `acs.exe`.
 
-## Layout
+- **On NixOS / Steam runtime hosts**: If `steam-run` is detected on PATH, the game is launched inside `steam-run` with clean library paths.
+- **Gamepad / Wheel in Proton**: Assetto Corsa reads gamepad input via XInput (`INPUT_METHOD=X360`). The launcher ensures Steam's `libSDL2` is available to Wine and sets `PROTON_DISABLE_HIDRAW` so controllers (e.g. DualShock / DualSense) are properly routed through SDL to XInput rather than captured as raw HID devices.
 
-- `crates/ac-core`: formats and logic, no UI. Covers `data.acd`, INI, lenient
-  `ui_*.json`, Steam/Proton paths, content scanning, `race.ini`, launch and mod
-  install.
-- `crates/cm-app`: the GPUI app and the CLI (binary `cm-rs`).
+---
 
-`cargo test -p ac-core` runs the unit tests.
-`cargo run -p ac-core --example verify` checks against a real install: it
-decrypts every `data.acd`, round-trips it, and prints a generated `race.ini`.
+## App Configuration
 
-## Provenance
+Configuration is stored in `~/.config/cm-rs/settings.toml` (following XDG standards).
+- On first launch, existing legacy `settings.json` is automatically migrated.
+- The active car, track, skin, and conditions from your last Quick Drive session are remembered across launches.
+- Custom Proton binary paths and Assetto Corsa install locations can be customized via the Settings tab or directly in `settings.toml`.
 
-Behavior follows Content Manager's AcTools library (MS-PL, © gro-ove). The
-`data.acd` key derivation was recovered from the closed `AcTools.AcdEncryption`
-module embedded in Content Manager 0.8.2782 for file-format interoperability.
-No license-check code, private API keys or closed service endpoints from
-`AcManager.Internal` are included. The text input is adapted from GPUI's
-`examples/input.rs` (Apache-2.0).
+---
+
+## CLI Usage
+
+`cm-rs` includes command-line commands for quick inspection or headless scripts:
+
+```sh
+# Inspect detected paths (Steam libraries, AC root, Proton binary, compatdata)
+cm-rs where
+
+# List installed content
+cm-rs list cars
+cm-rs list tracks
+cm-rs list events
+
+# Decrypt and unpack car data.acd
+cm-rs acd unpack content/cars/ks_ferrari_812_superfast/data.acd
+
+# Encrypt data/ folder back into data.acd
+cm-rs acd pack content/cars/ks_ferrari_812_superfast/data
+
+# Install car/track mod archives
+cm-rs install mod-package.zip
+```
+
+---
+
+## Project Structure
+
+- `crates/ac-core`: Pure domain logic, file format handlers, and game configuration (no UI).
+  - `acd.rs`: Encryption / decryption for `data.acd`.
+  - `ini.rs`: Order-preserving AC INI parser and writer.
+  - `content.rs`: Car, track, skin, and weather catalog scanners.
+  - `events.rs`: Career series, special events, medal targets, and progress tracking.
+  - `race.rs`: `race.ini` generator and session setup.
+  - `launch.rs`: Proton runner, runtime environment isolation, and process execution.
+  - `paths.rs`: Steam library, AC root, and compatdata directory discovery.
+  - `install.rs`: Mod archive inspection and layout extraction.
+  - `game_cfg.rs` & `gamepad.rs`: Assetto Corsa configuration files and controller capture.
+- `crates/cm-app`: GPUI desktop application and CLI entrypoint.
+
+---
+
+## Provenance & Attribution
+
+- File format logic and setup conventions follow Assetto Corsa's AcTools library (MS-PL, © gro-ove).
+- `data.acd` key derivation was reverse-engineered from `AcTools.AcdEncryption` in Content Manager 0.8.2782 for file-format interoperability.
+- No closed license checks, proprietary keys, or private API endpoints from `AcManager.Internal` are included.
+- Text input component adapted from GPUI's example implementation (Apache-2.0).
