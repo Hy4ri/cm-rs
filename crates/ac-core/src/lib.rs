@@ -7,6 +7,7 @@
 pub mod acd;
 pub mod bookmarks;
 pub mod content;
+pub mod events;
 pub mod game_cfg;
 #[cfg(target_os = "linux")]
 pub mod gamepad;

@@ -16,6 +16,7 @@ use gpui::{
 };
 
 use crate::browser_view::{BrowserView, PreviewDownload};
+use crate::events_view::{EventsView, Running};
 use crate::text_input::TextInput;
 use crate::theme;
 use crate::widgets::{
@@ -27,6 +28,8 @@ enum Page {
     QuickDrive,
     Cars,
     Tracks,
+    Career,
+    SpecialEvents,
     Install,
     Browser,
     Game,
@@ -34,10 +37,12 @@ enum Page {
 }
 
 /// Sidebar order, which L1/R1 on the controller walk through.
-const PAGES: [Page; 7] = [
+const PAGES: [Page; 9] = [
     Page::QuickDrive,
     Page::Cars,
     Page::Tracks,
+    Page::Career,
+    Page::SpecialEvents,
     Page::Browser,
     Page::Install,
     Page::Game,
@@ -95,6 +100,7 @@ pub struct CmApp {
     loading: bool,
     page: Page,
     browser: Option<Entity<BrowserView>>,
+    events: Option<Entity<EventsView>>,
 
     car: Option<usize>,
     skin: usize,
@@ -147,7 +153,7 @@ pub struct CmApp {
     pad_task: Option<gpui::Task<()>>,
 }
 
-const SIDEBAR_W: f32 = 190.;
+pub(crate) const SIDEBAR_W: f32 = 190.;
 const CAR_LIST_W: f32 = 300.;
 const TRACK_LIST_W: f32 = 280.;
 const ROW_H: f32 = 52.;
@@ -323,6 +329,7 @@ impl CmApp {
                 Page::Settings
             },
             browser: None,
+            events: None,
             settings,
             ac_root,
             content: Arc::default(),
@@ -557,6 +564,7 @@ impl CmApp {
         match launch::start(&root, &opts) {
             Ok(mut child) => {
                 self.game_running = true;
+                if let Some(events) = &self.events { events.update(cx, |view, cx| view.set_running(true, cx)); }
                 self.set_status("Assetto Corsa is starting…", false, cx);
                 cx.spawn(async move |this, cx| {
                     let code = cx
@@ -565,6 +573,7 @@ impl CmApp {
                         .await;
                     this.update(cx, |this, cx| {
                         this.game_running = false;
+                        if let Some(events) = &this.events { events.update(cx, |view, cx| view.set_running(false, cx)); }
                         match code {
                             Ok(c) if c.success() => this.set_status("Game closed.", false, cx),
                             Ok(c) => this.set_status(
@@ -1399,7 +1408,31 @@ impl CmApp {
 
     // ---------- views ----------
 
+    fn ensure_events(&mut self, career: bool, cx: &mut Context<Self>) {
+        let Some(root) = self.ac_root.clone() else { return; };
+        if self.events.as_ref().is_some_and(|e| e.read(cx).root != root) && !self.game_running {
+            self.events = None;
+        }
+        if self.events.is_none() {
+            let driver = self.settings.driver_name.clone();
+            let nationality = self.settings.nationality.clone();
+            let proton = self.settings.proton.clone();
+            let view = cx.new(|cx| EventsView::new(root, career, driver, nationality, proton, cx));
+            cx.subscribe(&view, |this, _, event: &Running, cx| {
+                this.game_running = event.0;
+                cx.notify();
+            }).detach();
+            view.update(cx, |view, cx| view.set_running(self.game_running, cx));
+            self.events = Some(view);
+        } else if let Some(view) = &self.events {
+            view.update(cx, |view, cx| view.configure(career, self.settings.driver_name.clone(), self.settings.nationality.clone(), self.settings.proton.clone(), cx));
+        }
+    }
+
     fn goto_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(page, Page::Career | Page::SpecialEvents) {
+            self.ensure_events(page == Page::Career, cx);
+        }
         if page == Page::Browser {
             self.ensure_browser(window, cx);
         }
@@ -1453,6 +1486,10 @@ impl CmApp {
             return;
         }
         if self.game_running || !window.is_window_active() {
+            return;
+        }
+        if matches!(self.page, Page::Career | Page::SpecialEvents) && !matches!(name, "LSHOULDER" | "RSHOULDER" | "B") {
+            if let Some(events) = &self.events { events.update(cx, |view, cx| view.pad(name, cx)); }
             return;
         }
         let here = PAGES.iter().position(|p| *p == self.page).unwrap_or(0);
@@ -2591,6 +2628,7 @@ impl Render for CmApp {
                 Page::QuickDrive => self.quick_drive_page(cx).into_any_element(),
                 Page::Cars => self.cars_page(cx).into_any_element(),
                 Page::Tracks => self.tracks_page(cx).into_any_element(),
+                Page::Career | Page::SpecialEvents => div().size_full().children(self.events.clone()).into_any_element(),
                 Page::Install => self
                     .install_page(text_w(main_w, INSTALL_MAX_W), cx)
                     .into_any_element(),
@@ -2645,6 +2683,8 @@ impl Render for CmApp {
                             .child(self.nav_item(Page::QuickDrive, "Quick Drive", cx))
                             .child(self.nav_item(Page::Cars, "Cars", cx))
                             .child(self.nav_item(Page::Tracks, "Tracks", cx))
+                            .child(self.nav_item(Page::Career, "Career", cx))
+                            .child(self.nav_item(Page::SpecialEvents, "Special Events", cx))
                             .child(self.nav_item(Page::Browser, "Get mods", cx))
                             .child(self.nav_item(Page::Install, "Install mods", cx))
                             .child(self.nav_item(Page::Game, "Game settings", cx))

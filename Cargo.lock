@@ -1037,6 +1037,7 @@ dependencies = [
  "dirs 6.0.0",
  "gpui",
  "image",
+ "serde_json",
  "unicode-segmentation",
 ]
 

@@ -11,7 +11,7 @@ With no command, opens the GUI.
 
   acd unpack <data.acd> [out_dir]   decrypt data.acd (default: <car>/data)
   acd pack <data_dir> [data.acd]    encrypt a data folder (default: <car>/data.acd)
-  list cars|tracks [ac_root]        list installed content
+  list cars|tracks|events [ac_root]        list installed content
   install <mod.zip> [ac_root]       install cars/tracks from a zip
   where                             show detected paths";
 
@@ -58,6 +58,26 @@ fn run_inner(args: &[String]) -> anyhow::Result<()> {
             for t in content::track_entries(&content::scan_tracks(&r)) {
                 println!("{:<40} {}", t.key(), t.layout.name);
             }
+        }
+        ["list", "events", rest @ ..] => {
+            let root = root(rest.first())?;
+            let catalog = ac_core::events::scan(&root);
+            let progress = ac_core::events::Progress::load(&root)?;
+            println!("{} series / {} career events / {} special events", catalog.series.len(), catalog.series.iter().map(|s| s.events.len()).sum::<usize>(), catalog.special.len());
+            for series in &catalog.series {
+                println!("{}: {} — {}", series.id, series.name, if series.completed(&progress) { "complete" } else if series.unlocked(&progress) { "unlocked" } else { "locked" });
+                for opponent in &series.opponents {
+                    println!("  {}: {} / {} / AI {}%", opponent.id, opponent.name, opponent.car, opponent.level);
+                }
+                for event in &series.events {
+                    println!("  {}: {} / {} / {} — medal {}", event.id, event.name, event.car, event.track, progress.get(&event.id).medal);
+                }
+            }
+            for event in &catalog.special {
+                println!("{}: {} / {} / {} — medal {}", event.id, event.name, event.car, event.track, progress.get(&event.id).medal);
+            }
+            for error in &catalog.errors { eprintln!("{error}"); }
+            anyhow::ensure!(catalog.errors.is_empty(), "Catalog contains unreadable events");
         }
         ["install", zip, rest @ ..] => {
             let r = root(rest.first())?;
