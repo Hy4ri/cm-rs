@@ -5,6 +5,7 @@
 //! Content Manager 0.8.2782.
 
 pub mod acd;
+pub mod bookmarks;
 pub mod content;
 pub mod game_cfg;
 #[cfg(target_os = "linux")]
