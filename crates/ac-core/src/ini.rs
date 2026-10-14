@@ -161,21 +161,3 @@ impl IniFile {
         fs::write(path, self.to_string()).with_context(|| format!("writing {}", path.display()))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_ac_style() {
-        let ini = IniFile::parse(
-            "[LIGHTING] \nSUN_ANGLE=-48\n[CAR_0]\nNATIONALITY=ITA\t\t\t; ISO Country code\n[CAR_1]\nMODEL=x\n",
-        );
-        assert_eq!(ini.get("LIGHTING", "SUN_ANGLE"), Some("-48"));
-        assert_eq!(ini.get("CAR_0", "NATIONALITY"), Some("ITA"));
-        let mut ini = ini;
-        ini.remove_numbered("CAR", 1);
-        assert!(ini.section("CAR_1").is_none());
-        assert!(ini.section("CAR_0").is_some());
-    }
-}

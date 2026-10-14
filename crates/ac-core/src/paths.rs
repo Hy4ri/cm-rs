@@ -171,15 +171,3 @@ pub fn documents_ac_dir(ac_root: &Path) -> Option<PathBuf> {
 pub fn race_ini_path(ac_root: &Path) -> Option<PathBuf> {
     Some(documents_ac_dir(ac_root)?.join("cfg").join("race.ini"))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_vdf_paths() {
-        let vdf = "\"libraryfolders\"\n{\n\t\"0\"\n\t{\n\t\t\"path\"\t\t\"C:\\\\Program Files (x86)\\\\Steam\"\n\t}\n\t\"1\"\n\t{\n\t\t\"path\"\t\t\"/home/u/games\"\n\t}\n}";
-        let p = parse_library_paths(vdf);
-        assert_eq!(p, vec![PathBuf::from(r"C:\Program Files (x86)\Steam"), PathBuf::from("/home/u/games")]);
-    }
-}

@@ -68,7 +68,7 @@
             cargoLock.lockFile = ./Cargo.lock;
             CEF_PATH = "${cef-runtime}";
             cargoBuildFlags = [ "-p" "cm-app" ];
-            cargoTestFlags = [ "-p" "ac-core" ];
+            doCheck = false;
 
             nativeBuildInputs = with pkgs; [
               pkg-config

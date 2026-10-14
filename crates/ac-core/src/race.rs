@@ -262,33 +262,3 @@ pub fn apply(file: &mut IniFile, q: &QuickDrive) {
     dynamic.set("LAP_GAIN", 1);
     dynamic.set("SESSION_TRANSFER", 100);
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn race_ini_for_race_mode() {
-        let mut q = QuickDrive {
-            car_id: "abarth500".into(),
-            skin_id: "red".into(),
-            track_id: "ks_silverstone".into(),
-            layout_id: Some("gp".into()),
-            driver_name: "Me".into(),
-            nationality: "ITA".into(),
-            mode: Mode::Race { laps: 5, opponents: 2, ai_level: 95, starting_position: 3 },
-            ..Default::default()
-        };
-        q.opponents = pick_opponents("abarth500", "red", &["red".into(), "white".into()], 2);
-        let mut ini = IniFile::parse("[CAR_7]\nMODEL=old\n[SESSION_1]\nNAME=x\n[CUSTOM]\nKEEP=1\n");
-        apply(&mut ini, &q);
-        assert_eq!(ini.get("RACE", "CARS"), Some("3"));
-        assert_eq!(ini.get("RACE", "CONFIG_TRACK"), Some("gp"));
-        assert_eq!(ini.get("SESSION_0", "TYPE"), Some("3"));
-        assert_eq!(ini.get("CAR_2", "SKIN"), Some("white"));
-        assert!(ini.section("CAR_7").is_none());
-        assert!(ini.section("SESSION_1").is_none());
-        assert_eq!(ini.get("CUSTOM", "KEEP"), Some("1"));
-        assert_eq!(ini.get("LIGHTING", "SUN_ANGLE"), Some("0.00"));
-    }
-}

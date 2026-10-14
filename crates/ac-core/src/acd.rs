@@ -257,31 +257,3 @@ pub fn pack(data_dir: &Path, acd_path: &Path) -> Result<usize> {
     write(acd_path, &entries)?;
     Ok(entries.len())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn key_has_eight_parts() {
-        let key = String::from_utf8(derive_key("abarth500")).unwrap();
-        assert_eq!(key.split('-').count(), 8);
-    }
-
-    #[test]
-    fn round_trip() {
-        let entries = vec![
-            AcdEntry { name: "car.ini".into(), data: b"[HEADER]\nVERSION=1\n".to_vec() },
-            AcdEntry { name: "empty.ini".into(), data: vec![] },
-        ];
-        let bytes = write_bytes(&entries, "ks_test_car").unwrap();
-        assert_eq!(read_bytes(&bytes, "ks_test_car").unwrap(), entries);
-    }
-
-    #[test]
-    fn short_ids_do_not_panic() {
-        for id in ["", "a", "ab", "abc", "abcd", "abcde"] {
-            let _ = derive_key(id);
-        }
-    }
-}

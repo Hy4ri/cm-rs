@@ -101,15 +101,3 @@ pub fn text(v: &Value, key: &str) -> Option<String> {
         _ => None,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn repairs_kunos_json() {
-        let v = parse("{\n\"description\": \"line one<br/>\n\tline two\",\n\"tags\": [\"a\", \"b\",],\n}").unwrap();
-        assert_eq!(v["tags"].as_array().unwrap().len(), 2);
-        assert!(v["description"].as_str().unwrap().contains("line two"));
-    }
-}

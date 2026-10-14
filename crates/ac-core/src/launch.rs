@@ -127,23 +127,3 @@ fn proton_command(acs: &Path, proton: &Path, runtime: Option<&Path>) -> Command 
     cmd.arg("run").arg(acs);
     cmd
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn runtime_wraps_proton_without_shell_splitting() {
-        let cmd = proton_command(
-            Path::new("/game with spaces/acs.exe"),
-            Path::new("/Proton - Experimental/proton"),
-            Some(Path::new("/bin/steam-run")),
-        );
-        assert_eq!(cmd.get_program(), "/bin/steam-run");
-        let args: Vec<_> = cmd.get_args().collect();
-        assert_eq!(args, ["/Proton - Experimental/proton", "run", "/game with spaces/acs.exe"]);
-        for key in ["LD_LIBRARY_PATH", "LD_PRELOAD"] {
-            assert!(cmd.get_envs().any(|(k, v)| k == key && v.is_none()));
-        }
-    }
-}

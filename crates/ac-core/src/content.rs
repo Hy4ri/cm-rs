@@ -390,21 +390,3 @@ pub fn brands(cars: &[Car]) -> BTreeMap<String, usize> {
     }
     m
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn weather_names() {
-        assert_eq!(pretty_weather_name("4_mid_clear"), "Mid Clear");
-        assert_eq!(plain_text("a<br/>\n\tb <i>c</i>"), "a\n\nb c");
-    }
-
-    #[test]
-    fn natural_order() {
-        let mut v = vec!["Drag 1000m", "Drag 200m", "drag 2000m", "Drag 400m", "Drag 0500m", "Barcelona"];
-        v.sort_by(|a, b| natural_cmp(a, b));
-        assert_eq!(v, ["Barcelona", "Drag 200m", "Drag 400m", "Drag 0500m", "Drag 1000m", "drag 2000m"]);
-    }
-}

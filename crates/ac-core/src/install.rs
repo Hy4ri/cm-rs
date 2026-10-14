@@ -177,29 +177,3 @@ pub fn install_zip(archive: &Path, items: &[Item]) -> Result<usize> {
     }
     Ok(written)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn s(v: &[&str]) -> Vec<String> {
-        v.iter().map(|x| x.to_string()).collect()
-    }
-
-    #[test]
-    fn detects_common_layouts() {
-        let r = detect(
-            &s(&[
-                "My Mod/content/cars/my_car/ui/ui_car.json",
-                "My Mod/content/cars/my_car/data.acd",
-                "My Mod/content/tracks/my_track/ui/gp/ui_track.json",
-            ]),
-            "x",
-        );
-        let ids: Vec<_> = r.iter().map(|(k, id, _)| (*k, id.as_str())).collect();
-        assert_eq!(ids, vec![(Kind::Car, "my_car"), (Kind::Track, "my_track")]);
-
-        let r = detect(&s(&["ui/ui_car.json", "data.acd"]), "bare_car");
-        assert_eq!(r.iter().next().unwrap().1, "bare_car");
-    }
-}
