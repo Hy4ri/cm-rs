@@ -10,9 +10,13 @@ It runs natively on Linux (and Windows), launching `acs.exe` through Proton with
 
 ## Screenshots
 
-| Cars & Liveries | Track Layouts |
+| Garage | Track Layouts |
 | :---: | :---: |
 | ![Cars](docs/screenshots/cars.png) | ![Tracks](docs/screenshots/tracks.png) |
+
+| Car & Track Picker (gamepad friendly) | Game Settings |
+| :---: | :---: |
+| ![Picker](docs/screenshots/picker.png) | ![Game Settings](docs/screenshots/game-settings.png) |
 
 | Career Mode | Special Events |
 | :---: | :---: |
