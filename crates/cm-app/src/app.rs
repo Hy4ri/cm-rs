@@ -11,6 +11,7 @@ use ac_core::settings::Settings;
 use ac_core::{acd, install, launch, paths};
 use gpui::{
     ClickEvent, Context, Div, Entity, FocusHandle, FontWeight, KeyDownEvent, ModifiersChangedEvent,
+    MouseMoveEvent,
     ObjectFit, PathPromptOptions, ScrollStrategy, SharedString, UniformListScrollHandle, Window,
     div, img, prelude::*, px, uniform_list,
 };
@@ -24,7 +25,7 @@ use crate::nav::NavAction;
 use crate::text_input::TextInput;
 use crate::theme;
 use crate::widgets::{
-    button, chip, field, hint, hint_bar, panel, picture, primary_button, section_title, segmented, setting_row,
+    button, chip, field, focus_ring, hint, hint_bar, panel, picture, primary_button, section_title, segmented, setting_row,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,6 +69,40 @@ fn page_label(page: Page) -> &'static str {
 
 fn tab_of(page: Page) -> usize {
     TABS.iter().position(|(_, pages)| pages.contains(&page)).unwrap_or(0)
+}
+
+/// One focusable row on the Drive page, in top-to-bottom order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DriveRow {
+    Car,
+    Track,
+    Mode,
+    Minutes,
+    Laps,
+    Opponents,
+    Ai,
+    Grid,
+    Penalties,
+    Time,
+    Temp,
+    Weather,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerKind {
+    Car,
+    Track,
+}
+
+const PICK_CARD_MIN_W: f32 = 200.;
+const PICK_CARD_H: f32 = 176.;
+const PICK_ROW_H: f32 = PICK_CARD_H + 12.;
+
+/// Columns and card width that fill a picker grid of `viewport_w` (24 px side padding, 12 px gaps).
+fn picker_geometry(viewport_w: f32) -> (usize, f32) {
+    let avail = (viewport_w - 48.).max(PICK_CARD_MIN_W);
+    let cols = (((avail + 12.) / (PICK_CARD_MIN_W + 12.)).floor() as usize).max(1);
+    (cols, (avail - 12. * (cols as f32 - 1.)) / cols as f32)
 }
 
 /// Next list index after moving `delta` rows, clamped; starts at the top with no selection.
@@ -139,7 +174,13 @@ pub struct CmApp {
     pad_nav: Option<gpui::Task<()>>,
     /// The press that finishes a bind capture is also seen by the nav reader; ignore it until this time.
     pad_mute_until: Option<std::time::Instant>,
-    pad_tracks: bool,
+    root_focus: FocusHandle,
+    drive_focus: usize,
+    picker: Option<PickerKind>,
+    picker_focus: usize,
+    picker_scroll: UniformListScrollHandle,
+    picker_cols: usize,
+    picker_card_w: f32,
     /// Last device that produced input; decides hint glyphs and focus-ring visibility.
     input_device: crate::nav::InputDevice,
     car_brand: Option<String>,
@@ -378,7 +419,13 @@ impl CmApp {
             track_scroll: UniformListScrollHandle::new(),
             pad_nav: None,
             pad_mute_until: None,
-            pad_tracks: false,
+            root_focus: cx.focus_handle(),
+            drive_focus: 0,
+            picker: None,
+            picker_focus: 0,
+            picker_scroll: UniformListScrollHandle::new(),
+            picker_cols: 1,
+            picker_card_w: PICK_CARD_MIN_W,
             input_device: crate::nav::InputDevice::default(),
             car_brand: None,
             tracks_view: Vec::new(),
@@ -1653,7 +1700,6 @@ impl CmApp {
         let tracks = match self.page {
             Page::Tracks => true,
             Page::Cars => false,
-            Page::QuickDrive => self.pad_tracks,
             _ => return,
         };
         if tracks {
@@ -1690,6 +1736,11 @@ impl CmApp {
         if self.game_running || !window.is_window_active() {
             return;
         }
+        if self.picker.is_some() {
+            self.picker_press(name, window, cx);
+            cx.notify();
+            return;
+        }
         if matches!(self.page, Page::Career | Page::SpecialEvents) && !matches!(name, "LSHOULDER" | "RSHOULDER" | "LTRIGGER" | "RTRIGGER" | "B") {
             if let Some(events) = &self.events { events.update(cx, |view, cx| view.pad(name, cx)); }
             return;
@@ -1706,13 +1757,9 @@ impl CmApp {
                     self.goto_page(pages[next], window, cx);
                 }
             }
+            _ if self.page == Page::QuickDrive => self.drive_press(name, window, cx),
             "DPAD_UP" => self.pad_move(-1),
             "DPAD_DOWN" => self.pad_move(1),
-            "DPAD_LEFT" | "DPAD_RIGHT" if self.page == Page::QuickDrive => {
-                self.pad_tracks = name == "DPAD_RIGHT";
-                let which = if self.pad_tracks { "tracks" } else { "cars" };
-                self.set_status(format!("Controller: D-pad moves the {which} list."), false, cx);
-            }
             "A" if matches!(self.page, Page::Cars | Page::Tracks) => self.goto_page(Page::QuickDrive, window, cx),
             "B" if self.page != Page::QuickDrive => self.goto_page(Page::QuickDrive, window, cx),
             "X" => {
@@ -1815,14 +1862,15 @@ impl CmApp {
     }
 
     /// Bottom bar: the buttons that work on this page, then the status line.
-    fn footer_bar(&self, status: SharedString, status_err: bool) -> Div {
+    fn footer_bar(&self, status: SharedString, status_err: bool, cx: &mut Context<Self>) -> Div {
         let dev = self.input_device;
         let h = |a: NavAction, text: &str| hint(dev.label(a), text);
         let mut hints = vec![h(NavAction::TabPrev, "Prev tab"), h(NavAction::TabNext, "Next tab")];
         match self.page {
             Page::Browser => hints.push(h(NavAction::Back, "Back to Drive")),
             Page::QuickDrive => {
-                hints.push(h(NavAction::Up, "Move"));
+                hints.push(hint(&format!("{} ↕↔", dev.label(NavAction::Up)), "Move / change"));
+                hints.push(h(NavAction::Confirm, "Open"));
                 hints.push(h(NavAction::Secondary, "Next skin"));
                 hints.push(h(NavAction::Primary, "Go!"));
             }
@@ -1847,9 +1895,21 @@ impl CmApp {
         let status_el = div()
             .text_xs()
             .text_color(if status_err { theme::error() } else { theme::muted() })
-            .child(status)
+            .child(status);
+        let go = matches!(self.page, Page::QuickDrive | Page::Cars | Page::Tracks).then(|| {
+            let label = if self.game_running { "Running…" } else { "Go!" };
+            primary_button("go", label)
+                .when(self.game_running, |d| d.opacity(0.6))
+                .when(!self.game_running, |d| d.on_click(cx.listener(Self::go)))
+        });
+        let primary = div()
+            .flex()
+            .items_center()
+            .gap_4()
+            .child(status_el)
+            .children(go)
             .into_any_element();
-        hint_bar(hints, Some(status_el))
+        hint_bar(hints, Some(primary))
     }
 
     /// Search box, "shown of total" line and the list itself.
@@ -2149,31 +2209,15 @@ impl CmApp {
         )
     }
 
-    /// `−  value  +` control; pair it with [`setting_row`] for the label.
-    fn stepper(
-        &self,
-        id: &'static str,
-        value: String,
-        step: fn(&mut CmApp, i32),
-        cx: &mut Context<Self>,
-    ) -> Div {
+    /// `−  value  +` control; the row it edits is the single source of truth for keyboard, pad and mouse.
+    fn stepper(&self, id: &'static str, value: String, row: DriveRow, value_w: f32, cx: &mut Context<Self>) -> Div {
         div()
             .flex()
             .items_center()
             .gap_1()
-            .child(
-                button((id, 0usize), "−").on_click(cx.listener(move |this, _, _, cx| {
-                    step(this, -1);
-                    cx.notify();
-                })),
-            )
-            .child(div().w(px(96.)).text_center().text_sm().child(value))
-            .child(
-                button((id, 1usize), "+").on_click(cx.listener(move |this, _, _, cx| {
-                    step(this, 1);
-                    cx.notify();
-                })),
-            )
+            .child(button((id, 0usize), "−").on_click(cx.listener(move |this, _, _, cx| this.drive_adjust(row, -1, cx))))
+            .child(div().w(px(value_w)).text_center().text_sm().child(value))
+            .child(button((id, 1usize), "+").on_click(cx.listener(move |this, _, _, cx| this.drive_adjust(row, 1, cx))))
     }
 
     fn open_quick_drive(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -2181,333 +2225,593 @@ impl CmApp {
         cx.notify();
     }
 
+    /// Focusable Drive rows for the current mode, top to bottom.
+    fn drive_rows(&self) -> Vec<DriveRow> {
+        use DriveRow::*;
+        let mut rows = vec![Car, Track, Mode];
+        match self.mode {
+            ModeKind::Practice => rows.push(Minutes),
+            ModeKind::Hotlap => {}
+            ModeKind::Race => rows.extend([Laps, Opponents, Ai, Grid]),
+        }
+        rows.extend([Penalties, Time, Temp, Weather]);
+        rows
+    }
+
+    /// Changes the value behind `row` by `dir` (-1 / +1); Car cycles the skin.
+    fn drive_adjust(&mut self, row: DriveRow, dir: i32, cx: &mut Context<Self>) {
+        match row {
+            DriveRow::Car => {
+                let n = self.selected_car().map(|c| c.skins.len()).unwrap_or(0);
+                if n > 0 {
+                    self.skin = (self.skin as i32 + dir).rem_euclid(n as i32) as usize;
+                }
+            }
+            DriveRow::Track => {}
+            DriveRow::Mode => {
+                let all = [ModeKind::Practice, ModeKind::Hotlap, ModeKind::Race];
+                let at = all.iter().position(|m| *m == self.mode).unwrap_or(0) as i32;
+                self.mode = all[(at + dir).rem_euclid(3) as usize];
+            }
+            DriveRow::Minutes => self.practice_minutes = (self.practice_minutes as i32 + dir * 5).clamp(0, 240) as u32,
+            DriveRow::Laps => self.laps = (self.laps as i32 + dir).clamp(1, 200) as u32,
+            DriveRow::Opponents => {
+                self.opponents = (self.opponents as i32 + dir).clamp(1, 40) as u32;
+                self.start_position = self.start_position.min(self.opponents + 1);
+            }
+            DriveRow::Ai => self.ai_level = (self.ai_level as i32 + dir).clamp(70, 100) as u32,
+            DriveRow::Grid => self.start_position = (self.start_position as i32 + dir).clamp(1, self.opponents as i32 + 1) as u32,
+            DriveRow::Penalties => self.penalties = !self.penalties,
+            DriveRow::Time => {
+                self.time_seconds = (self.time_seconds as i32 + dir * 1800).clamp(race::TIME_MIN as i32, race::TIME_MAX as i32) as u32
+            }
+            DriveRow::Temp => self.ambient = (self.ambient + dir).clamp(0, 40),
+            DriveRow::Weather => {
+                let n = self.content.weather.len();
+                if n > 0 {
+                    let at = self.content.weather.iter().position(|w| w.id == self.weather_id).unwrap_or(0) as i32;
+                    self.weather_id = self.content.weather[(at + dir).rem_euclid(n as i32) as usize].id.clone();
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// One controller/keyboard press on the Drive page (tab/sub-tab buttons are handled earlier).
+    fn drive_press(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = self.drive_rows();
+        let at = self.drive_focus.min(rows.len() - 1);
+        let row = rows[at];
+        match name {
+            "DPAD_UP" => self.drive_focus = at.saturating_sub(1),
+            "DPAD_DOWN" => self.drive_focus = (at + 1).min(rows.len() - 1),
+            "DPAD_LEFT" => self.drive_adjust(row, -1, cx),
+            "DPAD_RIGHT" => self.drive_adjust(row, 1, cx),
+            "A" => match row {
+                DriveRow::Car => self.open_picker(PickerKind::Car, window),
+                DriveRow::Track => self.open_picker(PickerKind::Track, window),
+                DriveRow::Mode | DriveRow::Penalties | DriveRow::Weather => self.drive_adjust(row, 1, cx),
+                _ => {}
+            },
+            "X" => self.drive_adjust(DriveRow::Car, 1, cx),
+            "START" => self.start_game(cx),
+            _ => {}
+        }
+    }
+
+    fn picker_view(&self) -> &[usize] {
+        match self.picker {
+            Some(PickerKind::Track) => &self.tracks_view,
+            _ => &self.cars_view,
+        }
+    }
+
+    fn open_picker(&mut self, kind: PickerKind, window: &Window) {
+        let (cols, w) = picker_geometry(f32::from(window.viewport_size().width));
+        self.picker_cols = cols;
+        self.picker_card_w = w;
+        self.picker = Some(kind);
+        let current = if kind == PickerKind::Car { self.car } else { self.track };
+        let view = self.picker_view();
+        self.picker_focus = current.and_then(|c| view.iter().position(|&i| i == c)).unwrap_or(0);
+        self.picker_scroll.scroll_to_item(self.picker_focus / cols, ScrollStrategy::Center);
+    }
+
+    fn pick(&mut self, kind: PickerKind, ix: usize, cx: &mut Context<Self>) {
+        match kind {
+            PickerKind::Car => {
+                self.car = Some(ix);
+                self.skin = 0;
+            }
+            PickerKind::Track => self.track = Some(ix),
+        }
+        self.picker = None;
+        cx.notify();
+    }
+
+    fn cycle_picker_sort(&mut self, cx: &mut Context<Self>) {
+        match self.picker {
+            Some(PickerKind::Car) => {
+                let at = CarSort::ALL.iter().position(|s| *s == self.car_sort).unwrap_or(0);
+                self.car_sort = CarSort::ALL[(at + 1) % CarSort::ALL.len()];
+            }
+            Some(PickerKind::Track) => {
+                let at = TrackSort::ALL.iter().position(|s| *s == self.track_sort).unwrap_or(0);
+                self.track_sort = TrackSort::ALL[(at + 1) % TrackSort::ALL.len()];
+            }
+            None => return,
+        }
+        self.picker_focus = 0;
+        self.picker_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.refilter(cx);
+    }
+
+    /// Steps the brand filter through All → each brand → All.
+    fn cycle_picker_brand(&mut self, dir: i32, cx: &mut Context<Self>) {
+        let brands = &self.content.car_brands;
+        let at = self
+            .car_brand
+            .as_ref()
+            .and_then(|b| brands.iter().position(|(n, _)| n.to_lowercase() == b.to_lowercase()))
+            .map_or(0, |i| i as i32 + 1);
+        let next = (at + dir).rem_euclid(brands.len() as i32 + 1);
+        self.car_brand = (next > 0).then(|| brands[next as usize - 1].0.clone());
+        self.picker_focus = 0;
+        self.picker_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.refilter(cx);
+    }
+
+    fn picker_press(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let kind = self.picker.unwrap_or(PickerKind::Car);
+        let len = self.picker_view().len();
+        let cols = self.picker_cols.max(1);
+        let at = self.picker_focus.min(len.saturating_sub(1));
+        let mut moved = |to: usize, this: &mut Self| {
+            this.picker_focus = to.min(len.saturating_sub(1));
+            this.picker_scroll.scroll_to_item(this.picker_focus / cols, ScrollStrategy::Center);
+        };
+        match name {
+            "DPAD_UP" if at >= cols => moved(at - cols, self),
+            "DPAD_DOWN" if at + cols < len => moved(at + cols, self),
+            "DPAD_LEFT" if at > 0 => moved(at - 1, self),
+            "DPAD_RIGHT" if at + 1 < len => moved(at + 1, self),
+            "A" => {
+                if let Some(&ix) = self.picker_view().get(at) {
+                    self.pick(kind, ix, cx);
+                }
+            }
+            "B" => self.picker = None,
+            "Y" => {
+                let input = if kind == PickerKind::Car { self.car_filter.clone() } else { self.track_filter.clone() };
+                input.read(cx).focus(window);
+            }
+            "X" => self.cycle_picker_sort(cx),
+            "LTRIGGER" if kind == PickerKind::Car => self.cycle_picker_brand(-1, cx),
+            "RTRIGGER" if kind == PickerKind::Car => self.cycle_picker_brand(1, cx),
+            _ => {}
+        }
+    }
+
+    /// Keyboard on the Drive/Garage/Tracks pages and the picker, mapped onto the pad buttons.
+    fn root_key(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.capturing.is_some() || self.pad_capturing.is_some() {
+            return;
+        }
+        if self.picker.is_none() && !matches!(self.page, Page::QuickDrive | Page::Cars | Page::Tracks) {
+            return;
+        }
+        let key = e.keystroke.key.as_str();
+        if self.car_filter.read(cx).is_focused(window) || self.track_filter.read(cx).is_focused(window) {
+            if matches!(key, "escape" | "down" | "enter") {
+                window.focus(&self.root_focus);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            return;
+        }
+        let name = match (key, e.keystroke.modifiers.control) {
+            ("up", _) => "DPAD_UP",
+            ("down", _) => "DPAD_DOWN",
+            ("left", _) => "DPAD_LEFT",
+            ("right", _) => "DPAD_RIGHT",
+            ("enter", true) => "START",
+            ("enter", false) | ("space", _) => "A",
+            ("escape", _) => "B",
+            ("q", _) => "LSHOULDER",
+            ("e", _) => "RSHOULDER",
+            ("[", _) => "LTRIGGER",
+            ("]", _) => "RTRIGGER",
+            ("x", _) => "X",
+            ("/", _) => "Y",
+            _ => return,
+        };
+        self.input_device = crate::nav::InputDevice::Keyboard;
+        cx.stop_propagation();
+        self.pad_press(name, window, cx);
+    }
+
+    pub fn focus_root(&self, window: &mut Window) {
+        window.focus(&self.root_focus);
+    }
+
+    /// A labelled, focusable Drive row; the ring only shows for keyboard/pad.
+    fn drive_row(&self, i: usize, label: &'static str, control: impl IntoElement, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        let focused = self.input_device.shows_focus() && self.picker.is_none() && self.drive_focus == i;
+        focus_ring(
+            div()
+                .id(("drow", i))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .min_h(px(theme::MIN_TARGET_H))
+                .px_3()
+                .rounded(px(theme::RADIUS_SM))
+                .bg(theme::raised()),
+            focused,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.drive_focus = i;
+            cx.notify();
+        }))
+        .child(div().text_sm().text_color(theme::muted()).child(label))
+        .child(control)
+    }
+
     fn quick_drive_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let car = self.selected_car();
         let skin = car.and_then(|c| c.skins.get(self.skin));
         let track = self.selected_track();
         let skin_count = car.map(|c| c.skins.len()).unwrap_or(0);
+        let shows = self.input_device.shows_focus() && self.picker.is_none();
+        let rows = self.drive_rows();
+        let at = self.drive_focus.min(rows.len() - 1);
 
         let skin_label = skin
-            .map(|s| format!("Skin: {} · {}/{}", s.name, self.skin + 1, skin_count))
+            .map(|s| format!("{} · {}/{}", s.name, self.skin + 1, skin_count))
             .unwrap_or_else(|| "No skins".into());
-        let car_block = panel()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(two_lines(
-                        car.map(|c| c.name.clone())
-                            .unwrap_or_else(|| "No car".into()),
-                        skin_label,
-                        None,
-                    ))
-                    .child(
-                        button("skin-prev", "◀").on_click(cx.listener(move |this, _, _, cx| {
-                            if skin_count > 0 {
-                                this.skin = (this.skin + skin_count - 1) % skin_count;
-                                cx.notify();
-                            }
-                        })),
-                    )
-                    .child(button("skin-next", "▶").on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            if skin_count > 0 {
-                                this.skin = (this.skin + 1) % skin_count;
-                                cx.notify();
-                            }
-                        },
-                    ))),
-            )
-            .child(picture(skin.and_then(|s| s.preview.clone()), 240.).w_full());
-
-        let track_block = panel()
-            .flex()
-            .items_center()
-            .gap_3()
-            .child(picture(track.and_then(|t| t.layout.preview.clone()), 72.).w(px(128.)))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_1()
-                    .child(
-                        div().font_weight(FontWeight::BOLD).truncate().child(
-                            track
-                                .map(|t| t.layout.name.clone())
-                                .unwrap_or_else(|| "No track".into()),
-                        ),
-                    )
-                    .when_some(track, |d, t| {
-                        let place = [t.layout.city.clone(), t.layout.country.clone()]
-                            .into_iter()
-                            .flatten()
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let size = format!(
-                            "{} · {} pit boxes",
-                            t.layout
-                                .length
-                                .clone()
-                                .map(|l| format!("{l} m"))
-                                .unwrap_or_else(|| "length ?".into()),
-                            t.layout
-                                .pitboxes
-                                .map(|p| p.to_string())
-                                .unwrap_or_else(|| "?".into())
-                        );
-                        d.child(
+        let car_sub = car
+            .map(|c| [c.brand.clone(), c.class.clone()].into_iter().flatten().collect::<Vec<_>>().join(" · "))
+            .unwrap_or_default();
+        let car_card = focus_ring(
+            div().id("drive-car").flex().flex_col().gap_2().p_3().rounded(px(theme::RADIUS_MD)).bg(theme::surface()),
+            shows && at == 0,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.drive_focus = 0;
+            cx.notify();
+        }))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().text_xs().text_color(theme::faint()).child("CAR"))
+                        .child(
                             div()
-                                .text_sm()
-                                .text_color(theme::muted())
+                                .text_xl()
+                                .font_weight(FontWeight::BOLD)
                                 .truncate()
-                                .child(place),
+                                .child(car.map(|c| c.name.clone()).unwrap_or_else(|| "No car".into())),
                         )
-                        .child(div().text_sm().text_color(theme::muted()).child(size))
-                    }),
-            )
-            .child(picture(track.and_then(|t| t.layout.outline.clone()), 72.).w(px(72.)));
+                        .child(div().text_sm().text_color(theme::muted()).truncate().child(car_sub)),
+                )
+                .child(button("car-change", "Change car").on_click(cx.listener(|this, _, window, cx| {
+                    this.drive_focus = 0;
+                    this.open_picker(PickerKind::Car, window);
+                    cx.notify();
+                }))),
+        )
+        .child(picture(skin.and_then(|s| s.preview.clone()), 230.).w_full())
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(button("skin-prev", "◀").on_click(cx.listener(|this, _, _, cx| this.drive_adjust(DriveRow::Car, -1, cx))))
+                .child(div().flex_1().text_sm().text_color(theme::muted()).truncate().text_center().child(format!("Skin: {skin_label}")))
+                .child(button("skin-next", "▶").on_click(cx.listener(|this, _, _, cx| this.drive_adjust(DriveRow::Car, 1, cx)))),
+        );
 
-        let mut session = panel()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(section_title("Session"))
-            .child(setting_row(
-                "Mode",
-                segmented(vec![
-                    chip("mode-practice", "Practice", self.mode == ModeKind::Practice).on_click(
-                        cx.listener(|this, _, _, cx| {
+        let track_place = track
+            .map(|t| [t.layout.city.clone(), t.layout.country.clone()].into_iter().flatten().collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        let track_size = track
+            .map(|t| {
+                format!(
+                    "{} · {} pit boxes",
+                    t.layout.length.clone().map(|l| format!("{l} m")).unwrap_or_else(|| "length ?".into()),
+                    t.layout.pitboxes.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+                )
+            })
+            .unwrap_or_default();
+        let track_card = focus_ring(
+            div().id("drive-track").flex().items_center().gap_3().p_3().rounded(px(theme::RADIUS_MD)).bg(theme::surface()),
+            shows && at == 1,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.drive_focus = 1;
+            cx.notify();
+        }))
+        .child(picture(track.and_then(|t| t.layout.preview.clone()), 84.).w(px(150.)))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(div().text_xs().text_color(theme::faint()).child("TRACK"))
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(FontWeight::BOLD)
+                        .truncate()
+                        .child(track.map(|t| t.layout.name.clone()).unwrap_or_else(|| "No track".into())),
+                )
+                .child(div().text_sm().text_color(theme::muted()).truncate().child(track_place))
+                .child(div().text_sm().text_color(theme::muted()).child(track_size)),
+        )
+        .child(picture(track.and_then(|t| t.layout.outline.clone()), 72.).w(px(72.)))
+        .child(button("track-change", "Change").on_click(cx.listener(|this, _, window, cx| {
+            this.drive_focus = 1;
+            this.open_picker(PickerKind::Track, window);
+            cx.notify();
+        })));
+
+        let mut session = div().flex().flex_col().gap_2().child(section_title("Session"));
+        for (i, row) in rows.iter().enumerate().skip(2) {
+            let row = *row;
+            let el = match row {
+                DriveRow::Mode => self.drive_row(
+                    i,
+                    "Mode",
+                    segmented(vec![
+                        chip("mode-practice", "Practice", self.mode == ModeKind::Practice).on_click(cx.listener(|this, _, _, cx| {
                             this.mode = ModeKind::Practice;
                             cx.notify();
-                        }),
-                    ),
-                    chip("mode-hotlap", "Hotlap", self.mode == ModeKind::Hotlap).on_click(
-                        cx.listener(|this, _, _, cx| {
+                        })),
+                        chip("mode-hotlap", "Hotlap", self.mode == ModeKind::Hotlap).on_click(cx.listener(|this, _, _, cx| {
                             this.mode = ModeKind::Hotlap;
                             cx.notify();
-                        }),
-                    ),
-                    chip("mode-race", "Quick race", self.mode == ModeKind::Race).on_click(
-                        cx.listener(|this, _, _, cx| {
+                        })),
+                        chip("mode-race", "Quick race", self.mode == ModeKind::Race).on_click(cx.listener(|this, _, _, cx| {
                             this.mode = ModeKind::Race;
                             cx.notify();
-                        }),
-                    ),
-                ]),
-            ));
-        match self.mode {
-            ModeKind::Practice => {
-                let label = if self.practice_minutes == 0 {
-                    "Unlimited".to_string()
-                } else {
-                    format!("{} min", self.practice_minutes)
-                };
-                session = session.child(setting_row(
-                    "Duration",
-                    self.stepper(
-                        "minutes",
-                        label,
-                        |t, d| {
-                            t.practice_minutes =
-                                (t.practice_minutes as i32 + d * 5).clamp(0, 240) as u32
-                        },
-                        cx,
-                    ),
-                ));
-            }
-            ModeKind::Hotlap => {}
-            ModeKind::Race => {
-                session = session
-                    .child(setting_row(
-                        "Laps",
-                        self.stepper(
-                            "laps",
-                            self.laps.to_string(),
-                            |t, d| t.laps = (t.laps as i32 + d).clamp(1, 200) as u32,
-                            cx,
-                        ),
-                    ))
-                    .child(setting_row(
-                        "Opponents",
-                        self.stepper(
-                            "opponents",
-                            self.opponents.to_string(),
-                            |t, d| {
-                                t.opponents = (t.opponents as i32 + d).clamp(1, 40) as u32;
-                                t.start_position = t.start_position.min(t.opponents + 1);
-                            },
-                            cx,
-                        ),
-                    ))
-                    .child(setting_row(
-                        "AI strength",
-                        self.stepper(
-                            "ai",
-                            format!("{}%", self.ai_level),
-                            |t, d| t.ai_level = (t.ai_level as i32 + d).clamp(70, 100) as u32,
-                            cx,
-                        ),
-                    ))
-                    .child(setting_row(
-                        "Start position",
-                        self.stepper(
-                            "grid",
-                            self.start_position.to_string(),
-                            |t, d| {
-                                t.start_position = (t.start_position as i32 + d)
-                                    .clamp(1, t.opponents as i32 + 1)
-                                    as u32
-                            },
-                            cx,
-                        ),
-                    ));
-            }
-        }
-        session = session.child(setting_row(
-            "Penalties",
-            segmented(vec![
-                chip("pen-on", "On", self.penalties).on_click(cx.listener(|this, _, _, cx| {
-                    this.penalties = true;
-                    cx.notify();
-                })),
-                chip("pen-off", "Off", !self.penalties).on_click(cx.listener(|this, _, _, cx| {
-                    this.penalties = false;
-                    cx.notify();
-                })),
-            ]),
-        ));
-
-        let road = race::road_temperature(self.time_seconds as f64, self.ambient as f64, 1.0);
-        let conditions = panel()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(section_title("Conditions"))
-            .child(setting_row(
-                "Time",
-                self.stepper(
-                    "time",
-                    fmt_time(self.time_seconds),
-                    |t, d| {
-                        t.time_seconds = (t.time_seconds as i32 + d * 1800)
-                            .clamp(race::TIME_MIN as i32, race::TIME_MAX as i32)
-                            as u32
-                    },
+                        })),
+                    ]),
                     cx,
                 ),
-            ))
-            .child(setting_row(
-                "Temperature",
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(self.stepper(
-                        "temp",
-                        format!("{}°C", self.ambient),
-                        |t, d| t.ambient = (t.ambient + d).clamp(0, 40),
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme::muted())
-                            .child(format!("road {road:.0}°C")),
-                    ),
-            ))
-            .child(setting_row(
-                "Weather",
-                div().flex().flex_1().flex_wrap().gap_1().children(
-                    self.content.weather.iter().enumerate().map(|(i, w)| {
-                        let id = w.id.clone();
-                        chip(("weather", i), w.name.clone(), self.weather_id == w.id).on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                this.weather_id = id.clone();
-                                cx.notify();
-                            }),
-                        )
-                    }),
+                DriveRow::Minutes => {
+                    let label = if self.practice_minutes == 0 { "Unlimited".to_string() } else { format!("{} min", self.practice_minutes) };
+                    self.drive_row(i, "Duration", self.stepper("minutes", label, row, 96., cx), cx)
+                }
+                DriveRow::Laps => self.drive_row(i, "Laps", self.stepper("laps", self.laps.to_string(), row, 96., cx), cx),
+                DriveRow::Opponents => self.drive_row(i, "Opponents", self.stepper("opponents", self.opponents.to_string(), row, 96., cx), cx),
+                DriveRow::Ai => self.drive_row(i, "AI strength", self.stepper("ai", format!("{}%", self.ai_level), row, 96., cx), cx),
+                DriveRow::Grid => self.drive_row(i, "Start position", self.stepper("grid", self.start_position.to_string(), row, 96., cx), cx),
+                DriveRow::Penalties => self.drive_row(
+                    i,
+                    "Penalties",
+                    segmented(vec![
+                        chip("pen-on", "On", self.penalties).on_click(cx.listener(|this, _, _, cx| {
+                            this.penalties = true;
+                            cx.notify();
+                        })),
+                        chip("pen-off", "Off", !self.penalties).on_click(cx.listener(|this, _, _, cx| {
+                            this.penalties = false;
+                            cx.notify();
+                        })),
+                    ]),
+                    cx,
                 ),
-            ));
-
-        let mode_name = match self.mode {
-            ModeKind::Practice => "Practice",
-            ModeKind::Hotlap => "Hotlap",
-            ModeKind::Race => "Quick race",
-        };
-        let summary = [
-            car.map(|c| c.name.clone()),
-            track.map(|t| t.layout.name.clone()),
-            Some(mode_name.to_owned()),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("  ·  ");
-        let go_label = if self.game_running {
-            "Running…"
-        } else {
-            "Go!"
-        };
-        let footer = div()
-            .flex()
-            .items_center()
-            .gap_3()
-            .px_4()
-            .py_2()
-            .border_t_1()
-            .border_color(theme::border())
-            .bg(theme::sidebar())
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_sm()
-                    .text_color(theme::muted())
-                    .truncate()
-                    .child(summary),
-            )
-            .child(
-                primary_button("go", go_label)
-                    .when(self.game_running, |d| d.opacity(0.6))
-                    .when(!self.game_running, |d| d.on_click(cx.listener(Self::go))),
-            );
+                DriveRow::Time => self.drive_row(i, "Time", self.stepper("time", fmt_time(self.time_seconds), row, 96., cx), cx),
+                DriveRow::Temp => {
+                    let road = race::road_temperature(self.time_seconds as f64, self.ambient as f64, 1.0);
+                    self.drive_row(
+                        i,
+                        "Temperature",
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(self.stepper("temp", format!("{}°C", self.ambient), row, 64., cx))
+                            .child(div().text_xs().text_color(theme::muted()).child(format!("road {road:.0}°C"))),
+                        cx,
+                    )
+                }
+                DriveRow::Weather => {
+                    let name = self
+                        .content
+                        .weather
+                        .iter()
+                        .find(|w| w.id == self.weather_id)
+                        .map(|w| w.name.clone())
+                        .unwrap_or_else(|| self.weather_id.clone());
+                    self.drive_row(i, "Weather", self.stepper("weather", name, row, 150., cx), cx)
+                }
+                DriveRow::Car | DriveRow::Track => continue,
+            };
+            session = session.child(el);
+        }
 
         div()
             .flex()
             .size_full()
-            .child(self.car_list(cx))
-            .child(self.track_list(cx))
+            .gap_4()
+            .p_4()
             .child(
                 div()
+                    .id("drive-left")
                     .flex()
                     .flex_col()
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .child(
-                        div()
-                            .id("qd-detail")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .p_3()
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .child(car_block)
-                            .child(track_block)
-                            .child(session)
-                            .child(conditions),
-                    )
-                    .child(footer),
+                    .gap_3()
+                    .overflow_y_scroll()
+                    .child(car_card)
+                    .child(track_card),
             )
+            .child(
+                div()
+                    .id("drive-right")
+                    .flex()
+                    .flex_col()
+                    .w(px(460.))
+                    .flex_shrink_0()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .child(session),
+            )
+    }
+
+    fn picker_card(&self, pos: usize, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        let kind = self.picker.unwrap_or(PickerKind::Car);
+        let w = self.picker_card_w;
+        let focused = self.input_device.shows_focus() && self.picker_focus == pos;
+        let (ix, title, sub, image, current) = match kind {
+            PickerKind::Car => {
+                let ix = self.cars_view[pos];
+                let c = &self.content.cars[ix];
+                let sub = [c.brand.clone(), c.class.clone()].into_iter().flatten().collect::<Vec<_>>().join(" · ");
+                (ix, c.name.clone(), sub, c.preview().map(|p| p.to_path_buf()), self.car == Some(ix))
+            }
+            PickerKind::Track => {
+                let ix = self.tracks_view[pos];
+                let t = &self.content.tracks[ix];
+                let sub = [t.layout.country.clone(), t.layout.length.clone().map(|l| format!("{l} m"))]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                (ix, t.layout.name.clone(), sub, t.layout.preview.clone().or_else(|| t.layout.outline.clone()), self.track == Some(ix))
+            }
+        };
+        focus_ring(
+            div()
+                .id(("pcard", pos))
+                .w(px(w))
+                .h(px(PICK_CARD_H))
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_2()
+                .rounded(px(theme::RADIUS_MD))
+                .cursor_pointer()
+                .when(current, |d| d.bg(theme::overlay()))
+                .when(!current, |d| d.bg(theme::surface()).hover(|s| s.bg(theme::raised()))),
+            focused,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| this.pick(kind, ix, cx)))
+        .child(picture(image, 108.).w_full())
+        .child(two_lines(title, sub, Some(w - 28.)))
+    }
+
+    /// Full-screen car/track picker: search, sort, brand filter and a grid of cards.
+    fn picker_sheet(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let kind = self.picker.unwrap_or(PickerKind::Car);
+        let cars = kind == PickerKind::Car;
+        let dev = self.input_device;
+        let (title, filter, counter, sort_label, desc) = if cars {
+            (
+                "Choose a car",
+                self.car_filter.clone(),
+                count_label(self.cars_view.len(), self.content.cars.len(), "cars"),
+                self.car_sort.label(),
+                self.car_sort_desc,
+            )
+        } else {
+            (
+                "Choose a track",
+                self.track_filter.clone(),
+                count_label(self.tracks_view.len(), self.content.tracks.len(), "layouts"),
+                self.track_sort.label(),
+                self.track_sort_desc,
+            )
+        };
+        let len = self.picker_view().len();
+        let cols = self.picker_cols.max(1);
+        let body: gpui::AnyElement = if len == 0 {
+            div().flex_1().flex().items_center().justify_center().text_color(theme::muted()).child("No matches").into_any_element()
+        } else {
+            uniform_list(
+                "picker-grid",
+                len.div_ceil(cols),
+                cx.processor(|this, range: Range<usize>, _window, cx| {
+                    let cols = this.picker_cols.max(1);
+                    let len = this.picker_view().len();
+                    range
+                        .map(|ri| {
+                            let mut row = div().id(("prow", ri)).flex().gap_3().h(px(PICK_ROW_H)).w_full();
+                            for pos in (ri * cols..(ri + 1) * cols).take_while(|p| *p < len) {
+                                row = row.child(this.picker_card(pos, cx));
+                            }
+                            row
+                        })
+                        .collect()
+                }),
+            )
+            .track_scroll(self.picker_scroll.clone())
+            .flex_1()
+            .px_6()
+            .into_any_element()
+        };
+        let mut hints = vec![
+            hint(dev.label(NavAction::Confirm), "Pick"),
+            hint(dev.label(NavAction::Back), "Close"),
+            hint(dev.label(NavAction::Search), "Search"),
+            hint(dev.label(NavAction::Secondary), "Sort"),
+        ];
+        if cars {
+            hints.push(hint(&format!("{}/{}", dev.label(NavAction::SubPrev), dev.label(NavAction::SubNext)), "Brand"));
+        }
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme::bg())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_6()
+                    .h(px(72.))
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(theme::border())
+                    .child(div().text_xl().font_weight(FontWeight::BOLD).child(title))
+                    .child(div().w(px(320.)).flex().child(grow_input(filter)))
+                    .child(div().text_sm().text_color(theme::muted()).child(counter))
+                    .child(div().flex_1())
+                    .child(
+                        button("pick-sort", format!("Sort: {sort_label} {}", if desc { "↓" } else { "↑" }))
+                            .on_click(cx.listener(|this, _, _, cx| this.cycle_picker_sort(cx))),
+                    )
+                    .when(cars, |d| {
+                        d.child(
+                            button("pick-brand", format!("Brand: {}", self.car_brand.clone().unwrap_or_else(|| "All".into())))
+                                .on_click(cx.listener(|this, _, _, cx| this.cycle_picker_brand(1, cx))),
+                        )
+                    })
+                    .child(button("pick-close", "Close").on_click(cx.listener(|this, _, _, cx| {
+                        this.picker = None;
+                        cx.notify();
+                    }))),
+            )
+            .child(div().h(px(12.)).flex_shrink_0())
+            .child(body)
+            .child(hint_bar(hints, None))
+            .into_any_element()
     }
 
     fn cars_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3112,8 +3416,18 @@ impl Render for CmApp {
             .size_full()
             .bg(theme::bg())
             .text_color(theme::text())
+            .relative()
+            .track_focus(&self.root_focus)
+            .on_key_down(cx.listener(Self::root_key))
+            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| {
+                if this.input_device != crate::nav::InputDevice::Mouse {
+                    this.input_device = crate::nav::InputDevice::Mouse;
+                    cx.notify();
+                }
+            }))
             .child(self.tab_bar(cx))
             .child(div().flex_1().min_h_0().min_w_0().child(page))
-            .child(self.footer_bar(status, status_err))
+            .child(self.footer_bar(status, status_err, cx))
+            .children(self.picker.map(|_| self.picker_sheet(cx)))
     }
 }

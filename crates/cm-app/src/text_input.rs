@@ -66,6 +66,14 @@ impl TextInput {
         }
     }
 
+    pub fn is_focused(&self, window: &Window) -> bool {
+        self.focus_handle.is_focused(window)
+    }
+
+    pub fn focus(&self, window: &mut Window) {
+        window.focus(&self.focus_handle);
+    }
+
     pub fn text(&self) -> String {
         self.content.to_string()
     }
