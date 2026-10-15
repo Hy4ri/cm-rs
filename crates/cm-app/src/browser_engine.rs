@@ -220,6 +220,7 @@ pub struct EngineInner {
     scale_factor: Mutex<f32>,
     download_callbacks: Mutex<HashMap<u32, DownloadItemCallback>>,
     is_closed: AtomicBool,
+    new_tabs: Mutex<Vec<String>>,
 }
 
 impl EngineInner {
@@ -237,6 +238,7 @@ impl EngineInner {
             scale_factor: Mutex::new(1.0),
             download_callbacks: Mutex::new(HashMap::new()),
             is_closed: AtomicBool::new(false),
+            new_tabs: Mutex::new(Vec::new()),
         }
     }
 
@@ -261,6 +263,7 @@ wrap_client! {
         inner: Arc<EngineInner>,
         render_handler: RenderHandler,
         load_handler: LoadHandler,
+        display_handler: DisplayHandler,
         life_span_handler: LifeSpanHandler,
         download_handler: DownloadHandler,
     }
@@ -272,6 +275,10 @@ wrap_client! {
 
         fn load_handler(&self) -> Option<LoadHandler> {
             Some(self.load_handler.clone())
+        }
+
+        fn display_handler(&self) -> Option<DisplayHandler> {
+            Some(self.display_handler.clone())
         }
 
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
@@ -404,6 +411,32 @@ wrap_load_handler! {
     }
 }
 
+// Track committed addresses (including same-document changes) and page titles.
+wrap_display_handler! {
+    struct CmDisplayHandler {
+        inner: Arc<EngineInner>,
+    }
+
+    impl DisplayHandler {
+        fn on_address_change(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, url: Option<&CefString>) {
+            if frame.is_some_and(|frame| frame.is_main() != 0)
+                && let Some(url) = url
+                && let Ok(mut snapshot) = self.inner.snapshot.lock()
+            {
+                snapshot.url = url.to_string();
+            }
+        }
+
+        fn on_title_change(&self, _browser: Option<&mut Browser>, title: Option<&CefString>) {
+            if let Some(title) = title
+                && let Ok(mut snapshot) = self.inner.snapshot.lock()
+            {
+                snapshot.title = title.to_string();
+            }
+        }
+    }
+}
+
 // Life span handler for popup interception and lifetime management
 wrap_life_span_handler! {
     struct CmLifeSpanHandler {
@@ -414,7 +447,7 @@ wrap_life_span_handler! {
         fn on_before_popup(
             &self,
             _browser: Option<&mut Browser>,
-            frame: Option<&mut Frame>,
+            _frame: Option<&mut Frame>,
             _popup_id: ::std::os::raw::c_int,
             target_url: Option<&CefString>,
             _target_frame_name: Option<&CefString>,
@@ -427,10 +460,13 @@ wrap_life_span_handler! {
             _extra_info: Option<&mut Option<cef::DictionaryValue>>,
             _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
         ) -> ::std::os::raw::c_int {
-            // Cancel popup window and navigate top frame instead
+            // Keep popups inside the tab strip, never in an unmanaged native window.
             if let Some(url) = target_url {
-                if let Some(f) = frame {
-                    f.load_url(Some(url));
+                let url = url.to_string();
+                if !url.is_empty()
+                    && let Ok(mut tabs) = self.inner.new_tabs.lock()
+                {
+                    tabs.push(url);
                 }
             }
             1 // 1 cancels the popup window creation
@@ -447,6 +483,12 @@ wrap_life_span_handler! {
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
             if let Ok(mut guard) = self.inner.browser.lock() {
                 *guard = None;
+            }
+            if let Ok(mut registry) = get_engine_registry().lock() {
+                registry.retain(|inner| !Arc::ptr_eq(inner, &self.inner));
+            }
+            if let Ok(mut callbacks) = self.inner.download_callbacks.lock() {
+                callbacks.clear();
             }
         }
     }
@@ -575,6 +617,7 @@ impl BrowserEngine {
 
         let render_handler = CmRenderHandler::new(inner.clone());
         let load_handler = CmLoadHandler::new(inner.clone());
+        let display_handler = CmDisplayHandler::new(inner.clone());
         let life_span_handler = CmLifeSpanHandler::new(inner.clone());
         let download_handler = CmDownloadHandler::new(inner.clone());
 
@@ -582,6 +625,7 @@ impl BrowserEngine {
             inner.clone(),
             render_handler,
             load_handler,
+            display_handler,
             life_span_handler,
             download_handler,
         );
@@ -614,6 +658,14 @@ impl BrowserEngine {
         }
 
         Ok(Self { inner })
+    }
+
+    pub fn take_new_tabs(&self) -> Vec<String> {
+        self.inner
+            .new_tabs
+            .lock()
+            .map(|mut tabs| std::mem::take(&mut *tabs))
+            .unwrap_or_default()
     }
 
     pub fn snapshot(&self) -> BrowserSnapshot {

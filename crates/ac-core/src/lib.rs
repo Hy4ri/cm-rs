@@ -6,6 +6,7 @@
 
 pub mod acd;
 pub mod bookmarks;
+pub mod browser_session;
 pub mod content;
 pub mod events;
 pub mod game_cfg;

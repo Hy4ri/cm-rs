@@ -29,7 +29,8 @@ use crate::theme;
 use crate::widgets::{button, chip, primary_button};
 
 /// Initial default home page for the mod browser.
-const DEFAULT_BROWSER_URL: &str = "https://www.overtake.gg/downloads/categories/assetto-corsa.1/";
+pub(crate) const DEFAULT_BROWSER_URL: &str =
+    "https://www.overtake.gg/downloads/categories/assetto-corsa.1/";
 
 /// Refresh polling interval for frames and snapshot updates.
 const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(16);
@@ -76,15 +77,18 @@ impl Focusable for BrowserView {
 }
 
 impl BrowserView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new_at(url: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        let address_input = cx.new(|cx| TextInput::new(cx, "Enter URL…", DEFAULT_BROWSER_URL));
+        let address_input = cx.new(|cx| TextInput::new(cx, "Enter URL…", url.to_owned()));
 
         let mut view = Self {
             focus_handle,
             address_input,
             engine: None,
-            snapshot: BrowserSnapshot::default(),
+            snapshot: BrowserSnapshot {
+                url: url.to_owned(),
+                ..Default::default()
+            },
             cached_render_image: None,
             retired_render_images: Vec::new(),
             current_bounds: None,
@@ -112,9 +116,37 @@ impl BrowserView {
             view.forward_focus(false);
         })
         .detach();
-        view.init_engine(DEFAULT_BROWSER_URL);
+        view.init_engine(url);
         view.start_refresh_timer(cx);
         view
+    }
+
+    pub fn release_images(&mut self, window: &mut Window) {
+        if let Some(image) = self.cached_render_image.take() {
+            let _ = window.drop_image(image);
+        }
+        for image in self.retired_render_images.drain(..) {
+            let _ = window.drop_image(image);
+        }
+    }
+
+    pub fn session_page(&self) -> Bookmark {
+        let snapshot = self
+            .engine
+            .as_ref()
+            .map(|engine| engine.snapshot())
+            .unwrap_or_else(|| self.snapshot.clone());
+        Bookmark {
+            title: snapshot.title,
+            url: snapshot.url,
+        }
+    }
+
+    pub fn take_new_tabs(&self) -> Vec<String> {
+        self.engine
+            .as_ref()
+            .map(|engine| engine.take_new_tabs())
+            .unwrap_or_default()
     }
 
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
@@ -129,6 +161,14 @@ impl BrowserView {
             }
         }
         if active {
+            match bookmarks::load() {
+                Ok(items) => {
+                    self.bookmarks = items;
+                    self.bookmark_error = None;
+                }
+                Err(error) => self.bookmark_error = Some(format!("{error:#}")),
+            }
+            self.tick(cx);
             self.start_refresh_timer(cx);
         } else {
             self.refresh_task = None;
