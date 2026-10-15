@@ -7,9 +7,6 @@ on:
         description: 'Release version (e.g. 0.2.0 or v0.2.0)'
         required: true
         type: string
-  push:
-    tags:
-      - 'v*'
 
 concurrency:
   group: release-${{ github.ref }}
@@ -99,17 +96,12 @@ jobs:
 
       - name: Build cm-rs with Nix
         run: |
-          nix build .#cm-rs --print-build-logs
+          nix build .#cm-rs-src --print-build-logs
 
       - name: Package release distribution
         run: |
           TAG="${{ steps.vars.outputs.tag }}"
-          mkdir -p dist
-
-          # Package the build output into tarball dereferencing symlinks
-          tar -czvhf "dist/cm-rs-${TAG}-linux-x86_64.tar.gz" -C result .
-
-          # Generate SHA256 checksums
+          scripts/package-release.sh "${TAG}" dist
           cd dist
           sha256sum *.tar.gz > SHA256SUMS.txt
           cat SHA256SUMS.txt
@@ -132,3 +124,16 @@ jobs:
           generate_release_notes: true
           files: |
             dist/*
+
+      - name: Pin flake to the published binary
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          VERSION="${{ steps.vars.outputs.version }}"
+          TAG="${{ steps.vars.outputs.tag }}"
+          HASH="$(nix hash file --type sha256 --sri "dist/cm-rs-${TAG}-linux-x86_64.tar.gz")"
+          printf '{\n  "version": "%s",\n  "hash": "%s"\n}\n' "$VERSION" "$HASH" > packaging/release.json
+          git add packaging/release.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): pin flake to ${TAG}"
+            git push origin "HEAD:${{ github.ref_name }}"
+          fi
