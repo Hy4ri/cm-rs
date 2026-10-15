@@ -15,6 +15,7 @@ use gpui::{
     div, img, prelude::*, px, uniform_list,
 };
 
+use crate::browser_downloads::{download_base_dir, manage_archives};
 use crate::browser_tabs::BrowserTabs as BrowserView;
 use crate::browser_view::PreviewDownload;
 use crate::content_sort::{CarSort, TrackSort};
@@ -151,6 +152,10 @@ pub struct CmApp {
     in_driver: Entity<TextInput>,
     in_nation: Entity<TextInput>,
     in_proton: Entity<TextInput>,
+    in_download_dir: Entity<TextInput>,
+    download_usage: String,
+    download_working: bool,
+    clear_download_confirm: Option<PathBuf>,
 
     game_cfg: Option<GameConfig>,
     game_error: Option<String>,
@@ -303,6 +308,8 @@ impl CmApp {
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         let in_proton = cx.new(|cx| TextInput::new(cx, "Auto-detect", proton_text));
+        let download_text = settings.download_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+        let in_download_dir = cx.new(|cx| TextInput::new(cx, "Default cache directory", download_text));
 
         let last = settings.last_quick_drive.clone().unwrap_or_default();
         let (mode, practice_minutes, laps, opponents, ai_level, start_position) = match last.mode {
@@ -378,6 +385,10 @@ impl CmApp {
             in_driver,
             in_nation,
             in_proton,
+            in_download_dir,
+            download_usage: "Not measured yet".into(),
+            download_working: false,
+            clear_download_confirm: None,
             game_cfg: None,
             game_error: None,
             game_tab: Tab::Video,
@@ -399,6 +410,7 @@ impl CmApp {
         } else {
             this.reload(cx);
         }
+        this.refresh_download_usage(cx);
         this
     }
 
@@ -659,6 +671,128 @@ impl CmApp {
         }
     }
 
+    fn refresh_download_usage(&mut self, cx: &mut Context<Self>) {
+        self.run_download_maintenance(false, cx);
+    }
+
+    fn run_download_maintenance(&mut self, clear: bool, cx: &mut Context<Self>) {
+        if self.download_working || (clear && self.busy) {
+            return;
+        }
+        let path = download_base_dir(self.settings.download_dir.as_deref());
+        if clear && self.clear_download_confirm.as_ref() != Some(&path) {
+            return;
+        }
+        self.clear_download_confirm = None;
+        if clear {
+            self.install_generation = self.install_generation.wrapping_add(1);
+            self.install = None;
+        }
+        self.download_working = true;
+        self.download_usage = if clear {
+            "Clearing ZIPs…"
+        } else {
+            "Measuring ZIPs…"
+        }
+        .into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_executor().spawn(async move {
+                let removed = if clear { Some(manage_archives(&path, true)?) } else { None };
+                let remaining = manage_archives(&path, false)?;
+                Ok::<_, std::io::Error>((removed, remaining))
+            }).await;
+            this.update(cx, |this, cx| {
+                this.download_working = false;
+                match result {
+                    Ok((removed, (count, bytes))) => {
+                        this.download_usage = format!("{count} ZIP files · {}", crate::browser_view::format_bytes(bytes as i64));
+                        if let Some((count, bytes)) = removed {
+                            // A preview of a removed archive is no longer installable.
+                            this.install = None;
+                            this.set_status(format!("Cleared {count} ZIP files ({}). Installed mods were not touched.", crate::browser_view::format_bytes(bytes as i64)), false, cx);
+                        }
+                    }
+                    Err(error) => {
+                        this.download_usage = format!("Could not read download storage: {error}");
+                        if clear {
+                            this.set_status(format!("Could not finish clearing ZIPs: {error}. Some files may already have been removed."), true, cx);
+                        }
+                    }
+                }
+                cx.notify();
+            }).ok();
+        }).detach();
+    }
+
+    fn save_download_directory(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.download_working {
+            return;
+        }
+        let text = self.in_download_dir.read(cx).text();
+        let path = (!text.trim().is_empty()).then(|| PathBuf::from(text.trim()));
+        if let Some(path) = &path {
+            if !path.is_absolute() {
+                return self.set_status(
+                    "Choose an absolute download directory, or leave it empty for the default.",
+                    true,
+                    cx,
+                );
+            }
+            if let Err(error) =
+                std::fs::create_dir_all(path).and_then(|_| std::fs::read_dir(path).map(|_| ()))
+            {
+                return self.set_status(
+                    format!("Cannot use download directory: {error}"),
+                    true,
+                    cx,
+                );
+            }
+        }
+        let mut settings = self.settings.clone();
+        settings.download_dir = path;
+        if let Err(error) = settings.save() {
+            return self.set_status(
+                format!("Couldn't save download directory: {error:#}"),
+                true,
+                cx,
+            );
+        }
+        self.settings = settings;
+        self.clear_download_confirm = None;
+        self.set_status("Download directory saved. New downloads use it immediately; existing files have not been moved.", false, cx);
+        self.refresh_download_usage(cx);
+    }
+
+    fn browse_download_directory(
+        &mut self,
+        _: &ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Select browser download directory".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                this.update(cx, |this, cx| {
+                    this.in_download_dir.update(cx, |input, cx| {
+                        input.set_text(path.display().to_string(), cx)
+                    });
+                    this.clear_download_confirm = None;
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     fn browse_root(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -712,6 +846,9 @@ impl CmApp {
     }
 
     fn preview_archive(&mut self, archive: PathBuf, cx: &mut Context<Self>) {
+        if self.download_working {
+            return self.set_status("Wait for download storage maintenance to finish.", true, cx);
+        }
         let Some(root) = self.ac_root.clone() else {
             self.set_status(
                 "Set your Assetto Corsa folder in Settings before installing mods.",
@@ -787,6 +924,9 @@ impl CmApp {
     }
 
     fn do_install(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.download_working {
+            return self.set_status("Wait for download storage maintenance to finish.", true, cx);
+        }
         if self.busy {
             return;
         }
@@ -1474,6 +1614,10 @@ impl CmApp {
         }
         if let Some(browser) = &self.browser {
             browser.update(cx, |browser, cx| browser.set_active(page == Page::Browser, cx));
+        }
+        if page == Page::Settings {
+            self.clear_download_confirm = None;
+            self.refresh_download_usage(cx);
         }
         self.page = page;
         if page == Page::Game {
@@ -2730,6 +2874,44 @@ impl CmApp {
             ))
             .child(hint("Three-letter code, for example ITA, GBR or JOR."));
 
+        let downloads = panel()
+            .flex().flex_col().gap_2()
+            .child(section_title("Browser downloads"))
+            .child(div().text_xs().text_color(theme::muted()).child("Download directory (empty = default cache)"))
+            .child(div().flex().items_center().gap_2()
+                .child(grow_input(self.in_download_dir.clone()))
+                .child(button("browse-download-directory", "Browse…")
+                    .on_click(cx.listener(Self::browse_download_directory)))
+                .child(button("save-download-directory", "Save folder")
+                    .when(!self.download_working, |d| d.on_click(cx.listener(Self::save_download_directory)))
+                    .when(self.download_working, |d| d.opacity(0.5))))
+            .child(info("Current download directory", download_base_dir(self.settings.download_dir.as_deref()).display().to_string()))
+            .child(div().w(px(text_w - PANEL_INSET)).text_xs().text_color(theme::muted())
+                .child("Folder changes apply to new downloads only. Existing ZIPs are not moved. Size and cleanup cover cm-rs ZIP downloads only; active downloads are skipped."))
+            .child(div().flex().items_center().gap_2()
+                .child(div().text_sm().child(self.download_usage.clone()))
+                .child(button("refresh-download-size", "Refresh")
+                    .when(!self.download_working, |d| d.on_click(cx.listener(|this, _, _, cx| this.refresh_download_usage(cx))))
+                    .when(self.download_working, |d| d.opacity(0.5)))
+                .child(button("clear-downloads", "Clear ZIP files…")
+                    .when(!self.download_working && !self.busy, |d| d.on_click(cx.listener(|this, _, _, cx| {
+                        this.clear_download_confirm = Some(download_base_dir(this.settings.download_dir.as_deref()));
+                        cx.notify();
+                    })))
+                    .when(self.download_working || self.busy, |d| d.opacity(0.5))))
+            .when_some(self.clear_download_confirm.as_ref(), |d, path| {
+                d.child(div().flex().flex_col().gap_2()
+                    .child(div().w(px(text_w - PANEL_INSET)).text_sm().text_color(theme::accent())
+                        .child(format!("Permanently delete the downloaded ZIP files in {}? Installed cars, tracks and other mods will NOT be deleted. Unrelated files and active downloads are kept. This cannot be undone.", path.display())))
+                    .child(div().flex().gap_2()
+                        .child(button("confirm-clear-downloads", "Delete downloaded ZIPs")
+                            .when(!self.download_working && !self.busy, |d| d.on_click(cx.listener(|this, _, _, cx| this.run_download_maintenance(true, cx)))))
+                        .child(button("cancel-clear-downloads", "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                            this.clear_download_confirm = None;
+                            cx.notify();
+                        })))))
+            });
+
         let detected = panel()
             .flex()
             .flex_col()
@@ -2766,6 +2948,7 @@ impl CmApp {
                         .font_weight(FontWeight::BOLD)
                         .child("Settings"),
                 )
+                .child(downloads)
                 .child(game)
                 .child(driver)
                 .child(

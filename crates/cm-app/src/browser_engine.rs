@@ -14,7 +14,7 @@ use cef::rc::Rc;
 // CEF wrapper macros require the generated Impl/Wrap traits in scope.
 use cef::{args::Args, *};
 
-use crate::browser_downloads::{target_download_path, upsert_download_record};
+use crate::browser_downloads::{finish_download, target_download_path, upsert_download_record};
 use crate::browser_types::{
     BrowserFrame, BrowserKey, BrowserModifiers, BrowserMouseButton, BrowserSnapshot, DownloadStatus,
 };
@@ -579,6 +579,9 @@ wrap_download_handler! {
                 };
 
                 let path_buf = PathBuf::from(CefString::from(&item.full_path()).to_string());
+                if status == DownloadStatus::Complete || status == DownloadStatus::Cancelled {
+                    finish_download(&path_buf);
+                }
                 if status != DownloadStatus::Downloading {
                     if let Ok(mut callbacks) = self.inner.download_callbacks.lock() {
                         callbacks.remove(&id);
