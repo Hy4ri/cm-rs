@@ -18,6 +18,8 @@ pub struct Settings {
     /// Linux: explicit `proton` script; auto-detected when unset.
     pub proton: Option<PathBuf>,
     pub last_quick_drive: Option<QuickDrive>,
+    /// Browser archive storage; unset uses the application's XDG cache directory.
+    pub download_dir: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -28,6 +30,7 @@ impl Default for Settings {
             nationality: "ITA".into(),
             proton: None,
             last_quick_drive: None,
+            download_dir: None,
         }
     }
 }

@@ -1132,7 +1132,7 @@ fn downloads_changed(a: &[BrowserDownload], b: &[BrowserDownload]) -> bool {
     false
 }
 
-fn format_bytes(bytes: i64) -> String {
+pub(crate) fn format_bytes(bytes: i64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
     } else if bytes < 1024 * 1024 {
