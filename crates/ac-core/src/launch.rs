@@ -56,6 +56,18 @@ pub fn start(ac_root: &Path, opts: &LaunchOptions) -> Result<Child> {
             bail!("steam-run is required on NixOS; enable/install it alongside Steam");
         }
         let mut c = proton_command(&acs, &proton, runtime.as_deref());
+        // A Nix dev shell exports ~20 KB of stdenv build variables. Windows caps the
+        // environment block at 32 KB, so Wine's steam.exe fails to create acs.exe
+        // (error 731) when the launcher inherits them. Keep the system-level Nix vars
+        // (nix-ld, profiles) and drop the rest.
+        const KEEP: [&str; 5] = ["NIX_LD", "NIX_LD_LIBRARY_PATH", "NIX_PATH", "NIX_PROFILES", "NIX_USER_PROFILE_DIR"];
+        for (key, _) in std::env::vars_os() {
+            let name = key.to_string_lossy();
+            let build_var = (name.starts_with("NIX") && !KEEP.contains(&&*name)) || name == "IN_NIX_SHELL";
+            if build_var {
+                c.env_remove(key);
+            }
+        }
         c.env("STEAM_COMPAT_DATA_PATH", compat)
             .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", steam_root)
             .env("STEAM_COMPAT_APP_ID", &app_id);
