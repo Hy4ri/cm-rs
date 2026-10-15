@@ -81,8 +81,7 @@ fn main() {
                     let mut app = app::CmApp::new(cx);
                     #[cfg(target_os = "linux")]
                     app.start_pad_nav(window, cx);
-                    #[cfg(not(target_os = "linux"))]
-                    let _ = window;
+                    app.focus_root(window);
                     app
                 })
             },
