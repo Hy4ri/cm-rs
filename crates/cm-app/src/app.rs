@@ -15,7 +15,8 @@ use gpui::{
     div, img, prelude::*, px, uniform_list,
 };
 
-use crate::browser_view::{BrowserView, PreviewDownload};
+use crate::browser_tabs::BrowserTabs as BrowserView;
+use crate::browser_view::PreviewDownload;
 use crate::content_sort::{CarSort, TrackSort};
 use crate::events_view::{EventsView, Running};
 use crate::text_input::TextInput;

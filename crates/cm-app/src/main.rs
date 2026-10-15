@@ -1,6 +1,7 @@
 mod app;
 mod browser_downloads;
 mod browser_engine;
+mod browser_tabs;
 mod browser_types;
 mod browser_view;
 mod cli;
