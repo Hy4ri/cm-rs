@@ -43,6 +43,15 @@ pub struct Car {
 }
 
 impl Car {
+    /// Display group used by both the brand picker and its filtering predicate.
+    pub fn brand_name(&self) -> &str {
+        self.brand
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .unwrap_or("Unknown")
+    }
+
     pub fn preview(&self) -> Option<&Path> {
         self.skins.iter().find_map(|s| s.preview.as_deref())
     }
@@ -384,9 +393,13 @@ pub fn spec_label(key: &str) -> &str {
 
 /// Groups cars by brand for quick filtering.
 pub fn brands(cars: &[Car]) -> BTreeMap<String, usize> {
-    let mut m = BTreeMap::new();
-    for c in cars {
-        *m.entry(c.brand.clone().unwrap_or_else(|| "Unknown".into())).or_insert(0) += 1;
+    let mut groups = BTreeMap::<String, (String, usize)>::new();
+    for car in cars {
+        let name = car.brand_name();
+        let group = groups
+            .entry(name.to_lowercase())
+            .or_insert_with(|| (name.to_owned(), 0));
+        group.1 += 1;
     }
-    m
+    groups.into_values().collect()
 }

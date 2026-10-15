@@ -70,15 +70,19 @@ struct Content {
     tracks: Vec<TrackEntry>,
     weather: Vec<Weather>,
     car_search: Vec<String>,
+    car_brands: Vec<(String, usize)>,
     track_search: Vec<String>,
 }
 
 impl Content {
     fn scan(root: &std::path::Path) -> Self {
         let cars = content::scan_cars(root);
+        let mut car_brands: Vec<_> = content::brands(&cars).into_iter().collect();
+        car_brands.sort_by(|(a, _), (b, _)| content::natural_cmp(a, b));
         let tracks = content::track_entries(&content::scan_tracks(root));
         Content {
             car_search: cars.iter().map(|c| c.search_text()).collect(),
+            car_brands,
             track_search: tracks.iter().map(|t| t.search_text()).collect(),
             weather: content::scan_weather(root),
             cars,
@@ -116,7 +120,6 @@ pub struct CmApp {
     pad_mute_until: Option<std::time::Instant>,
     pad_tracks: bool,
     car_brand: Option<String>,
-    brand_open: bool,
     tracks_view: Vec<usize>,
 
     mode: ModeKind,
@@ -163,11 +166,6 @@ const TRACK_THUMB_W: f32 = 40.;
 /// horizontal padding, selection border, thumbnail and gap.
 const fn row_text_w(list_w: f32, thumb_w: f32) -> f32 {
     list_w - 1. - 16. - 2. - thumb_w - 8.
-}
-
-/// The brand a car is grouped under; matches `content::brands`.
-fn car_brand_name(c: &Car) -> &str {
-    c.brand.as_deref().unwrap_or("Unknown")
 }
 
 fn count_label(shown: usize, total: usize, noun: &str) -> String {
@@ -346,7 +344,6 @@ impl CmApp {
             pad_mute_until: None,
             pad_tracks: false,
             car_brand: None,
-            brand_open: false,
             tracks_view: Vec::new(),
             mode,
             practice_minutes,
@@ -456,16 +453,27 @@ impl CmApp {
         let matches = |hay: &str, q: &str| q.split_whitespace().all(|w| hay.contains(w));
         // A brand that vanished after a rescan would hide every car.
         if let Some(b) = &self.car_brand
-            && !self.content.cars.iter().any(|c| car_brand_name(c) == b)
+            && !self
+                .content
+                .car_brands
+                .iter()
+                .any(|(name, _)| name.to_lowercase() == b.to_lowercase())
         {
             self.car_brand = None;
         }
-        self.cars_view = (0..self.content.cars.len())
+        let brand = self.car_brand.as_ref().map(|b| b.to_lowercase());
+        let cars_view: Vec<_> = (0..self.content.cars.len())
             .filter(|&i| {
-                self.car_brand.as_deref().is_none_or(|b| car_brand_name(&self.content.cars[i]) == b)
+                brand
+                    .as_deref()
+                    .is_none_or(|b| self.content.cars[i].brand_name().to_lowercase() == b)
                     && matches(&self.content.car_search[i], &car_q)
             })
             .collect();
+        if cars_view != self.cars_view && !cars_view.is_empty() {
+            self.car_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        }
+        self.cars_view = cars_view;
         self.tracks_view = (0..self.content.tracks.len())
             .filter(|&i| matches(&self.content.track_search[i], &track_q))
             .collect();
@@ -1596,59 +1604,67 @@ impl CmApp {
             .child(list)
     }
 
-    /// "Brand: X" toggle that opens a grid of brand chips with car counts.
+    /// Always-visible, scrollable brands from the installed car catalog.
     fn brand_header(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let brands = content::brands(&self.content.cars);
-        let current = self.car_brand.clone();
-        let label = format!("Brand: {} {}", current.as_deref().unwrap_or("All"), if self.brand_open { "▴" } else { "▾" });
-        let mut col = div().flex().flex_col().w_full().px_2().pt_2().gap_1().child(
-            div().flex().gap_1().child(
-                chip("brand-toggle", label, current.is_some()).on_click(cx.listener(|this, _, _, cx| {
-                    this.brand_open = !this.brand_open;
-                    cx.notify();
-                })),
-            ).when(current.is_some(), |d| {
-                d.child(button("brand-clear", "Clear").on_click(cx.listener(|this, _, _, cx| {
-                    this.car_brand = None;
-                    this.refilter(cx);
-                })))
-            }),
-        );
-        if self.brand_open {
-            let mut chips = vec![
-                chip("brand-all", format!("All ({})", self.content.cars.len()), current.is_none())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.car_brand = None;
-                        this.brand_open = false;
+        let current = self.car_brand.as_deref();
+        let all = chip(
+            "brand-all",
+            format!("All brands ({})", self.content.cars.len()),
+            current.is_none(),
+        )
+        .w_full()
+        .flex_shrink_0()
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.car_brand = None;
+            this.refilter(cx);
+        }));
+        let mut rows = Vec::new();
+        for (i, (name, count)) in self.content.car_brands.iter().enumerate() {
+            let active = current.is_some_and(|b| b.to_lowercase() == name.to_lowercase());
+            let pick = name.clone();
+            rows.push(
+                chip(("brand", i), "", active)
+                    .w_full()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(div().w(px(CAR_LIST_W - 90.)).truncate().child(name.clone()))
+                    .child(div().flex_shrink_0().child(count.to_string()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.car_brand = Some(pick.clone());
                         this.refilter(cx);
                     }))
                     .into_any_element(),
-            ];
-            for (i, (name, n)) in brands.into_iter().enumerate() {
-                let active = current.as_deref() == Some(name.as_str());
-                let pick = name.clone();
-                chips.push(
-                    chip(("brand", i), format!("{name} ({n})"), active)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.car_brand = Some(pick.clone());
-                            this.brand_open = false;
-                            this.refilter(cx);
-                        }))
-                        .into_any_element(),
-                );
-            }
-            col = col.child(
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .w_full()
+            .px_2()
+            .pt_2()
+            .gap_1()
+            .child(
                 div()
-                    .id("brand-grid")
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child(format!("Brands ({})", self.content.car_brands.len())),
+            )
+            .child(all)
+            .child(
+                div()
+                    .id("brand-list")
                     .flex()
-                    .flex_wrap()
+                    .flex_col()
                     .gap_1()
                     .max_h(px(180.))
                     .overflow_y_scroll()
-                    .children(chips),
-            );
-        }
-        col.into_any_element()
+                    .children(rows),
+            )
+            .into_any_element()
     }
 
     fn car_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
