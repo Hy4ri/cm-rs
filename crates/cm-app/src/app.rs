@@ -20,10 +20,11 @@ use crate::browser_tabs::BrowserTabs as BrowserView;
 use crate::browser_view::PreviewDownload;
 use crate::content_sort::{CarSort, TrackSort};
 use crate::events_view::{EventsView, Running};
+use crate::nav::NavAction;
 use crate::text_input::TextInput;
 use crate::theme;
 use crate::widgets::{
-    button, chip, field, panel, picture, primary_button, section_title, segmented, setting_row,
+    button, chip, field, hint, hint_bar, panel, picture, primary_button, section_title, segmented, setting_row,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -39,18 +40,35 @@ enum Page {
     Settings,
 }
 
-/// Sidebar order, which L1/R1 on the controller walk through.
-const PAGES: [Page; 9] = [
-    Page::QuickDrive,
-    Page::Cars,
-    Page::Tracks,
-    Page::Career,
-    Page::SpecialEvents,
-    Page::Browser,
-    Page::Install,
-    Page::Game,
-    Page::Settings,
+/// Top-level tabs in bar order; L1/R1 walk these. Each tab owns one or more pages, and
+/// L2/R2 walk the pages inside the active tab (shown as a sub-tab strip when there are several).
+const TABS: [(&str, &[Page]); 7] = [
+    ("Drive", &[Page::QuickDrive]),
+    ("Garage", &[Page::Cars]),
+    ("Tracks", &[Page::Tracks]),
+    ("Career", &[Page::Career]),
+    ("Events", &[Page::SpecialEvents]),
+    ("Mods", &[Page::Browser, Page::Install]),
+    ("Settings", &[Page::Game, Page::Settings]),
 ];
+
+fn page_label(page: Page) -> &'static str {
+    match page {
+        Page::Browser => "Get mods",
+        Page::Install => "Install",
+        Page::Game => "Game",
+        Page::Settings => "App",
+        Page::QuickDrive => "Drive",
+        Page::Cars => "Garage",
+        Page::Tracks => "Tracks",
+        Page::Career => "Career",
+        Page::SpecialEvents => "Events",
+    }
+}
+
+fn tab_of(page: Page) -> usize {
+    TABS.iter().position(|(_, pages)| pages.contains(&page)).unwrap_or(0)
+}
 
 /// Next list index after moving `delta` rows, clamped; starts at the top with no selection.
 fn step_index(pos: Option<usize>, delta: isize, len: usize) -> usize {
@@ -171,7 +189,8 @@ pub struct CmApp {
     pad_task: Option<gpui::Task<()>>,
 }
 
-pub(crate) const SIDEBAR_W: f32 = 190.;
+/// Left chrome width; the sidebar is gone (top tab bar), kept so page-width maths stays explicit.
+pub(crate) const SIDEBAR_W: f32 = 0.;
 const CAR_LIST_W: f32 = 300.;
 const TRACK_LIST_W: f32 = 280.;
 const ROW_H: f32 = 52.;
@@ -1671,14 +1690,22 @@ impl CmApp {
         if self.game_running || !window.is_window_active() {
             return;
         }
-        if matches!(self.page, Page::Career | Page::SpecialEvents) && !matches!(name, "LSHOULDER" | "RSHOULDER" | "B") {
+        if matches!(self.page, Page::Career | Page::SpecialEvents) && !matches!(name, "LSHOULDER" | "RSHOULDER" | "LTRIGGER" | "RTRIGGER" | "B") {
             if let Some(events) = &self.events { events.update(cx, |view, cx| view.pad(name, cx)); }
             return;
         }
-        let here = PAGES.iter().position(|p| *p == self.page).unwrap_or(0);
+        let here = tab_of(self.page);
         match name {
-            "LSHOULDER" => self.goto_page(PAGES[(here + PAGES.len() - 1) % PAGES.len()], window, cx),
-            "RSHOULDER" => self.goto_page(PAGES[(here + 1) % PAGES.len()], window, cx),
+            "LSHOULDER" => self.goto_page(TABS[(here + TABS.len() - 1) % TABS.len()].1[0], window, cx),
+            "RSHOULDER" => self.goto_page(TABS[(here + 1) % TABS.len()].1[0], window, cx),
+            "LTRIGGER" | "RTRIGGER" => {
+                let pages = TABS[here].1;
+                if pages.len() > 1 {
+                    let at = pages.iter().position(|p| *p == self.page).unwrap_or(0);
+                    let next = if name == "RTRIGGER" { (at + 1) % pages.len() } else { (at + pages.len() - 1) % pages.len() };
+                    self.goto_page(pages[next], window, cx);
+                }
+            }
             "DPAD_UP" => self.pad_move(-1),
             "DPAD_DOWN" => self.pad_move(1),
             "DPAD_LEFT" | "DPAD_RIGHT" if self.page == Page::QuickDrive => {
@@ -1736,32 +1763,93 @@ impl CmApp {
         }));
     }
 
-    fn nav_item(
-        &self,
-        page: Page,
-        label: &'static str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let active = self.page == page;
+    /// One pill in the top tab bar or the sub-tab strip.
+    fn tab_button(&self, id: impl Into<gpui::ElementId>, label: &'static str, active: bool, page: Page, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
         div()
-            .id(label)
+            .id(id)
+            .flex()
+            .items_center()
+            .h(px(theme::MIN_TARGET_H))
             .px_4()
-            .py_2()
+            .rounded(px(theme::RADIUS_SM))
             .text_sm()
             .cursor_pointer()
-            .border_l_2()
-            .when(active, |d| {
-                d.border_color(theme::accent())
-                    .bg(theme::panel())
-                    .text_color(theme::text())
-            })
-            .when(!active, |d| {
-                d.border_color(theme::sidebar())
-                    .text_color(theme::muted())
-                    .hover(|s| s.text_color(theme::text()))
-            })
+            .when(active, |d| d.bg(theme::raised()).text_color(theme::text()).font_weight(FontWeight::BOLD))
+            .when(!active, |d| d.text_color(theme::muted()).hover(|s| s.bg(theme::surface()).text_color(theme::text())))
             .on_click(cx.listener(move |this, _, window, cx| this.goto_page(page, window, cx)))
             .child(label)
+    }
+
+    /// Brand, the seven tabs flanked by the L1/R1 glyphs, and a sub-tab strip when the tab has several pages.
+    fn tab_bar(&self, cx: &mut Context<Self>) -> Div {
+        let here = tab_of(self.page);
+        let dev = self.input_device;
+        let glyph = |a: NavAction| {
+            div().px_2().py_0p5().rounded(px(theme::RADIUS_SM)).border_1().border_color(theme::border()).text_xs().text_color(theme::muted()).child(dev.label(a))
+        };
+        let mut tabs = div().flex().items_center().gap_1();
+        for (i, (label, pages)) in TABS.iter().enumerate() {
+            tabs = tabs.child(self.tab_button(("tab", i), label, i == here, pages[0], cx));
+        }
+        let mut bar = div().flex().flex_col().flex_shrink_0().bg(theme::surface()).border_b_1().border_color(theme::border()).child(
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_4()
+                .h(px(56.))
+                .child(div().mr_4().text_lg().font_weight(FontWeight::BOLD).text_color(theme::accent()).child("Content Manager"))
+                .child(glyph(NavAction::TabPrev))
+                .child(tabs)
+                .child(glyph(NavAction::TabNext)),
+        );
+        let pages = TABS[here].1;
+        if pages.len() > 1 {
+            let mut subs = div().flex().items_center().gap_1().px_4().pb_2().child(div().mr_2().child(glyph(NavAction::SubPrev)));
+            for (i, page) in pages.iter().enumerate() {
+                subs = subs.child(self.tab_button(("subtab", i), page_label(*page), *page == self.page, *page, cx));
+            }
+            bar = bar.child(subs.child(div().ml_2().child(glyph(NavAction::SubNext))));
+        }
+        bar
+    }
+
+    /// Bottom bar: the buttons that work on this page, then the status line.
+    fn footer_bar(&self, status: SharedString, status_err: bool) -> Div {
+        let dev = self.input_device;
+        let h = |a: NavAction, text: &str| hint(dev.label(a), text);
+        let mut hints = vec![h(NavAction::TabPrev, "Prev tab"), h(NavAction::TabNext, "Next tab")];
+        match self.page {
+            Page::Browser => hints.push(h(NavAction::Back, "Back to Drive")),
+            Page::QuickDrive => {
+                hints.push(h(NavAction::Up, "Move"));
+                hints.push(h(NavAction::Secondary, "Next skin"));
+                hints.push(h(NavAction::Primary, "Go!"));
+            }
+            Page::Cars | Page::Tracks => {
+                hints.push(h(NavAction::Up, "Move"));
+                hints.push(h(NavAction::Confirm, "Pick"));
+                hints.push(h(NavAction::Primary, "Go!"));
+            }
+            Page::Career | Page::SpecialEvents => {
+                hints.push(h(NavAction::Up, "Move"));
+                hints.push(h(NavAction::Confirm, "Start"));
+                hints.push(h(NavAction::Back, "Back"));
+            }
+            Page::Install | Page::Game | Page::Settings => {
+                if TABS[tab_of(self.page)].1.len() > 1 {
+                    hints.push(h(NavAction::SubPrev, "Prev page"));
+                    hints.push(h(NavAction::SubNext, "Next page"));
+                }
+                hints.push(h(NavAction::Back, "Back"));
+            }
+        }
+        let status_el = div()
+            .text_xs()
+            .text_color(if status_err { theme::error() } else { theme::muted() })
+            .child(status)
+            .into_any_element();
+        hint_bar(hints, Some(status_el))
     }
 
     /// Search box, "shown of total" line and the list itself.
@@ -3024,56 +3112,8 @@ impl Render for CmApp {
             .size_full()
             .bg(theme::bg())
             .text_color(theme::text())
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .w(px(SIDEBAR_W))
-                            .flex_shrink_0()
-                            .bg(theme::sidebar())
-                            .pt_4()
-                            .child(
-                                div()
-                                    .px_4()
-                                    .pb_4()
-                                    .text_lg()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(theme::accent())
-                                    .child("Content Manager"),
-                            )
-                            .child(self.nav_item(Page::QuickDrive, "Quick Drive", cx))
-                            .child(self.nav_item(Page::Cars, "Cars", cx))
-                            .child(self.nav_item(Page::Tracks, "Tracks", cx))
-                            .child(self.nav_item(Page::Career, "Career", cx))
-                            .child(self.nav_item(Page::SpecialEvents, "Special Events", cx))
-                            .child(self.nav_item(Page::Browser, "Get mods", cx))
-                            .child(self.nav_item(Page::Install, "Install mods", cx))
-                            .child(self.nav_item(Page::Game, "Game settings", cx))
-                            .child(self.nav_item(Page::Settings, "Settings", cx)),
-                    )
-                    .child(div().flex_1().min_w_0().h_full().child(page)),
-            )
-            .child(
-                div()
-                    .h(px(26.))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .border_t_1()
-                    .border_color(theme::border())
-                    .bg(theme::sidebar())
-                    .text_xs()
-                    .text_color(if status_err {
-                        theme::error()
-                    } else {
-                        theme::muted()
-                    })
-                    .child(status),
-            )
+            .child(self.tab_bar(cx))
+            .child(div().flex_1().min_h_0().min_w_0().child(page))
+            .child(self.footer_bar(status, status_err))
     }
 }
