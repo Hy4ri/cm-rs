@@ -219,7 +219,7 @@ pub fn hint_bar(hints: Vec<Div>, primary: Option<AnyElement>) -> Div {
     }
 
     let mut bar = div()
-        .h(px(56.))
+        .h(px(40.))
         .px_6()
         .bg(theme::surface())
         .border_t_1()
