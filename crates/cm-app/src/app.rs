@@ -25,7 +25,7 @@ use crate::nav::NavAction;
 use crate::text_input::TextInput;
 use crate::theme;
 use crate::widgets::{
-    button, chip, field, focus_ring, hint, hint_bar, panel, picture, primary_button, section_title, segmented, setting_row,
+    button, chip, field, focus_ring, hint, hint_bar, panel, picture, primary_button, section_title, segmented,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -189,8 +189,6 @@ pub struct CmApp {
     track_sort: TrackSort,
     car_sort_desc: bool,
     track_sort_desc: bool,
-    car_sort_open: bool,
-    track_sort_open: bool,
 
     mode: ModeKind,
     practice_minutes: u32,
@@ -232,44 +230,12 @@ pub struct CmApp {
 
 /// Left chrome width; the sidebar is gone (top tab bar), kept so page-width maths stays explicit.
 pub(crate) const SIDEBAR_W: f32 = 0.;
-const CAR_LIST_W: f32 = 300.;
-const TRACK_LIST_W: f32 = 280.;
-const ROW_H: f32 = 52.;
-const CAR_THUMB_W: f32 = 76.;
-const TRACK_THUMB_W: f32 = 40.;
-/// Text width left in a list row: column minus its right border, the row's
-/// horizontal padding, selection border, thumbnail and gap.
-const fn row_text_w(list_w: f32, thumb_w: f32) -> f32 {
-    list_w - 1. - 16. - 2. - thumb_w - 8.
-}
-
 fn count_label(shown: usize, total: usize, noun: &str) -> String {
     if shown == total {
         format!("{total} {noun}")
     } else {
         format!("{shown} of {total} {noun}")
     }
-}
-
-/// One clickable row of a virtualized list (fixed height, as `uniform_list` requires).
-fn list_row(ix: usize, selected: bool) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(ix)
-        .w_full()
-        .h(px(ROW_H))
-        .px_2()
-        .flex()
-        .items_center()
-        .gap_2()
-        .cursor_pointer()
-        .border_l_2()
-        .when(selected, |d| {
-            d.bg(theme::selected()).border_color(theme::accent())
-        })
-        .when(!selected, |d| {
-            d.border_color(gpui::transparent_black())
-                .hover(|s| s.bg(theme::panel_hover()))
-        })
 }
 
 /// Title + muted subtitle, both truncated with an ellipsis.
@@ -433,8 +399,6 @@ impl CmApp {
             track_sort: TrackSort::default(),
             car_sort_desc: false,
             track_sort_desc: false,
-            car_sort_open: false,
-            track_sort_open: false,
             mode,
             practice_minutes,
             laps,
@@ -1760,7 +1724,8 @@ impl CmApp {
             _ if self.page == Page::QuickDrive => self.drive_press(name, window, cx),
             "DPAD_UP" => self.pad_move(-1),
             "DPAD_DOWN" => self.pad_move(1),
-            "A" if matches!(self.page, Page::Cars | Page::Tracks) => self.goto_page(Page::QuickDrive, window, cx),
+            "A" if self.page == Page::Cars => self.open_picker(PickerKind::Car, window),
+            "A" if self.page == Page::Tracks => self.open_picker(PickerKind::Track, window),
             "B" if self.page != Page::QuickDrive => self.goto_page(Page::QuickDrive, window, cx),
             "X" => {
                 let n = self.selected_car().map(|c| c.skins.len()).unwrap_or(0);
@@ -1875,8 +1840,8 @@ impl CmApp {
                 hints.push(h(NavAction::Primary, "Go!"));
             }
             Page::Cars | Page::Tracks => {
-                hints.push(h(NavAction::Up, "Move"));
-                hints.push(h(NavAction::Confirm, "Pick"));
+                hints.push(h(NavAction::Confirm, "Change"));
+                hints.push(h(NavAction::Back, "Drive"));
                 hints.push(h(NavAction::Primary, "Go!"));
             }
             Page::Career | Page::SpecialEvents => {
@@ -1910,303 +1875,6 @@ impl CmApp {
             .children(go)
             .into_any_element();
         hint_bar(hints, Some(primary))
-    }
-
-    /// Search box, "shown of total" line and the list itself.
-    fn list_column(
-        &self,
-        width: f32,
-        filter: Entity<TextInput>,
-        counter: String,
-        header: Option<gpui::AnyElement>,
-        list: impl IntoElement,
-    ) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .w(px(width))
-            .flex_shrink_0()
-            .h_full()
-            .border_r_1()
-            .border_color(theme::border())
-            .child(div().flex().w_full().px_2().pt_2().child(filter))
-            .children(header)
-            .child(
-                div()
-                    .px_3()
-                    .py_1()
-                    .text_xs()
-                    .text_color(theme::muted())
-                    .child(counter),
-            )
-            .child(list)
-    }
-
-    /// Always-visible, scrollable brands from the installed car catalog.
-    fn brand_header(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let current = self.car_brand.as_deref();
-        let all = chip(
-            "brand-all",
-            format!("All brands ({})", self.content.cars.len()),
-            current.is_none(),
-        )
-        .w_full()
-        .flex_shrink_0()
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.car_brand = None;
-            this.refilter(cx);
-        }));
-        let mut rows = Vec::new();
-        for (i, (name, count)) in self.content.car_brands.iter().enumerate() {
-            let active = current.is_some_and(|b| b.to_lowercase() == name.to_lowercase());
-            let pick = name.clone();
-            rows.push(
-                chip(("brand", i), "", active)
-                    .w_full()
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(div().w(px(CAR_LIST_W - 90.)).truncate().child(name.clone()))
-                    .child(div().flex_shrink_0().child(count.to_string()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.car_brand = Some(pick.clone());
-                        this.refilter(cx);
-                    }))
-                    .into_any_element(),
-            );
-        }
-        div()
-            .flex()
-            .flex_col()
-            .flex_shrink_0()
-            .w_full()
-            .px_2()
-            .pt_2()
-            .gap_1()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme::muted())
-                    .child(format!("Brands ({})", self.content.car_brands.len())),
-            )
-            .child(all)
-            .child(
-                div()
-                    .id("brand-list")
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .max_h(px(180.))
-                    .overflow_y_scroll()
-                    .children(rows),
-            )
-            .into_any_element()
-    }
-
-    /// Compact independent sort pickers shared by the content pages and Quick Drive.
-    fn sort_header(&self, cars: bool, cx: &mut Context<Self>) -> Div {
-        let (label, open, descending, width) = if cars {
-            (
-                self.car_sort.label(),
-                self.car_sort_open,
-                self.car_sort_desc,
-                CAR_LIST_W,
-            )
-        } else {
-            (
-                self.track_sort.label(),
-                self.track_sort_open,
-                self.track_sort_desc,
-                TRACK_LIST_W,
-            )
-        };
-        let id = if cars { "car-sort" } else { "track-sort" };
-        let mut header =
-            div()
-                .flex()
-                .flex_col()
-                .flex_shrink_0()
-                .px_2()
-                .pt_2()
-                .gap_1()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            button(
-                                id,
-                                format!("Sort: {label} {}", if open { "▴" } else { "▾" }),
-                            )
-                                .w(px(width - 96.))
-                                .truncate()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if cars {
-                                        this.car_sort_open = !this.car_sort_open;
-                                    } else {
-                                        this.track_sort_open = !this.track_sort_open;
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            button((id, 0_usize), if descending { "↓ Desc" } else { "↑ Asc" })
-                                .flex_shrink_0()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if cars {
-                                        this.car_sort_desc = !this.car_sort_desc;
-                                    } else {
-                                        this.track_sort_desc = !this.track_sort_desc;
-                                    }
-                                    this.refilter(cx);
-                                    if cars {
-                                        this.car_scroll.scroll_to_item(0, ScrollStrategy::Top);
-                                    } else {
-                                        this.track_scroll.scroll_to_item(0, ScrollStrategy::Top);
-                                    }
-                                })),
-                        ),
-                );
-        if open {
-            let labels: Vec<_> = if cars {
-                CarSort::ALL.iter().map(|sort| sort.label()).collect()
-            } else {
-                TrackSort::ALL.iter().map(|sort| sort.label()).collect()
-            };
-            header = header.child(
-                div()
-                    .id((id, 1_usize))
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .max_h(px(180.))
-                    .overflow_y_scroll()
-                    .children(labels.into_iter().enumerate().map(|(index, option)| {
-                        chip((id, index + 2), option, label == option).on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                if cars {
-                                    this.car_sort = CarSort::ALL[index];
-                                    this.car_sort_open = false;
-                                } else {
-                                    this.track_sort = TrackSort::ALL[index];
-                                    this.track_sort_open = false;
-                                }
-                                this.refilter(cx);
-                                if cars {
-                                    this.car_scroll.scroll_to_item(0, ScrollStrategy::Top);
-                                } else {
-                                    this.track_scroll.scroll_to_item(0, ScrollStrategy::Top);
-                                }
-                            },
-                        ))
-                    })),
-            );
-        }
-        header
-    }
-
-    fn car_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let counter = count_label(self.cars_view.len(), self.content.cars.len(), "cars");
-        let list = uniform_list(
-            "car-list",
-            self.cars_view.len(),
-            cx.processor(|this, range: Range<usize>, _window, cx| {
-                range
-                    .map(|ix| {
-                        let car_ix = this.cars_view[ix];
-                        let car = &this.content.cars[car_ix];
-                        let selected = this.car == Some(car_ix);
-                        let sub = [car.brand.clone(), car.class.clone()]
-                            .into_iter()
-                            .flatten()
-                            .collect::<Vec<_>>()
-                            .join(" · ");
-                        list_row(ix, selected)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.car = Some(car_ix);
-                                this.skin = 0;
-                                cx.notify();
-                            }))
-                            .child(
-                                picture(car.preview().map(|p| p.to_path_buf()), 43.)
-                                    .w(px(CAR_THUMB_W)),
-                            )
-                            .child(two_lines(
-                                car.name.clone(),
-                                sub,
-                                Some(row_text_w(CAR_LIST_W, CAR_THUMB_W)),
-                            ))
-                    })
-                    .collect()
-            }),
-        )
-        .track_scroll(self.car_scroll.clone())
-        .flex_1();
-        let header = div()
-            .flex()
-            .flex_col()
-            .child(self.brand_header(cx))
-            .child(self.sort_header(true, cx))
-            .into_any_element();
-        self.list_column(
-            CAR_LIST_W,
-            self.car_filter.clone(),
-            counter,
-            Some(header),
-            list,
-        )
-    }
-
-    fn track_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let counter = count_label(self.tracks_view.len(), self.content.tracks.len(), "layouts");
-        let list = uniform_list(
-            "track-list",
-            self.tracks_view.len(),
-            cx.processor(|this, range: Range<usize>, _window, cx| {
-                range
-                    .map(|ix| {
-                        let t_ix = this.tracks_view[ix];
-                        let t = &this.content.tracks[t_ix];
-                        let selected = this.track == Some(t_ix);
-                        let sub = [
-                            t.layout.country.clone(),
-                            t.layout.length.clone().map(|l| format!("{l} m")),
-                        ]
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>()
-                        .join(" · ");
-                        list_row(ix, selected)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.track = Some(t_ix);
-                                cx.notify();
-                            }))
-                            .child(
-                                picture(t.layout.outline.clone(), TRACK_THUMB_W)
-                                    .w(px(TRACK_THUMB_W)),
-                            )
-                            .child(two_lines(
-                                t.layout.name.clone(),
-                                sub,
-                                Some(row_text_w(TRACK_LIST_W, TRACK_THUMB_W)),
-                            ))
-                    })
-                    .collect()
-            }),
-        )
-        .track_scroll(self.track_scroll.clone())
-        .flex_1();
-        let header = self.sort_header(false, cx).into_any_element();
-        self.list_column(
-            TRACK_LIST_W,
-            self.track_filter.clone(),
-            counter,
-            Some(header),
-            list,
-        )
     }
 
     /// `−  value  +` control; the row it edits is the single source of truth for keyboard, pad and mouse.
@@ -2366,7 +2034,7 @@ impl CmApp {
         let len = self.picker_view().len();
         let cols = self.picker_cols.max(1);
         let at = self.picker_focus.min(len.saturating_sub(1));
-        let mut moved = |to: usize, this: &mut Self| {
+        let moved = |to: usize, this: &mut Self| {
             this.picker_focus = to.min(len.saturating_sub(1));
             this.picker_scroll.scroll_to_item(this.picker_focus / cols, ScrollStrategy::Center);
         };
@@ -2862,6 +2530,12 @@ impl CmApp {
                                 .flex_shrink_0()
                                 .items_center()
                                 .gap_2()
+                                .child(button("garage-change", "Change car").on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.open_picker(PickerKind::Car, window);
+                                        cx.notify();
+                                    }),
+                                ))
                                 .child(button("open-folder", "Open folder").on_click(
                                     cx.listener(move |_, _, _, cx| cx.open_with_system(&dir)),
                                 ))
@@ -2981,15 +2655,11 @@ impl CmApp {
                         })
                 }
             };
-        div().flex().size_full().child(self.car_list(cx)).child(
-            div()
-                .id("car-detail")
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .overflow_y_scroll()
-                .child(detail),
-        )
+        div()
+            .id("car-detail")
+            .size_full()
+            .overflow_y_scroll()
+            .child(detail)
     }
 
     fn tracks_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3038,6 +2708,12 @@ impl CmApp {
                                         .truncate()
                                         .child(l.name.clone()),
                                 )
+                                .child(button("tracks-change", "Change track").on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.open_picker(PickerKind::Track, window);
+                                        cx.notify();
+                                    }),
+                                ))
                                 .child(
                                     primary_button("drive-track", "Drive")
                                         .on_click(cx.listener(Self::open_quick_drive)),
@@ -3069,15 +2745,11 @@ impl CmApp {
                         })
                 }
             };
-        div().flex().size_full().child(self.track_list(cx)).child(
-            div()
-                .id("track-detail")
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .overflow_y_scroll()
-                .child(detail),
-        )
+        div()
+            .id("track-detail")
+            .size_full()
+            .overflow_y_scroll()
+            .child(detail)
     }
 
     /// `text_w`: pixel width for wrapping text in the page column (see [`text_w`]).
