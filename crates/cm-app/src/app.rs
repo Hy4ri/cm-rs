@@ -122,6 +122,8 @@ pub struct CmApp {
     /// The press that finishes a bind capture is also seen by the nav reader; ignore it until this time.
     pad_mute_until: Option<std::time::Instant>,
     pad_tracks: bool,
+    /// Last device that produced input; decides hint glyphs and focus-ring visibility.
+    input_device: crate::nav::InputDevice,
     car_brand: Option<String>,
     tracks_view: Vec<usize>,
     car_sort: CarSort,
@@ -358,6 +360,7 @@ impl CmApp {
             pad_nav: None,
             pad_mute_until: None,
             pad_tracks: false,
+            input_device: crate::nav::InputDevice::default(),
             car_brand: None,
             tracks_view: Vec::new(),
             car_sort: CarSort::default(),
@@ -1699,20 +1702,35 @@ impl CmApp {
 
     #[cfg(target_os = "linux")]
     pub fn start_pad_nav(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use ac_core::gamepad::{Press, Reader};
+        use ac_core::gamepad::Nav;
         self.pad_nav = Some(cx.spawn_in(window, async move |this, cx| {
-            let mut reader: Option<Reader> = None;
+            let mut nav: Option<Nav> = None;
             let mut ticks = 0u32;
             loop {
                 cx.background_executor().timer(std::time::Duration::from_millis(16)).await;
                 // Reopen every ~5 s so a pad that connects or reconnects is picked up.
                 if ticks % 312 == 0 {
-                    reader = Reader::open().ok();
+                    nav = Nav::open().ok();
                 }
                 ticks = ticks.wrapping_add(1);
-                let Some(Press::Button(name)) = reader.as_mut().and_then(|r| r.poll()) else { continue };
-                if this.update_in(cx, |this, window, cx| this.pad_press(name, window, cx)).is_err() {
-                    return;
+                let Some(nav) = nav.as_mut() else { continue };
+                let presses = nav.poll(std::time::Instant::now());
+                if presses.is_empty() {
+                    continue;
+                }
+                let device = if nav.is_playstation() {
+                    crate::nav::InputDevice::PlayStation
+                } else {
+                    crate::nav::InputDevice::Xbox
+                };
+                for name in presses {
+                    let ok = this.update_in(cx, |this, window, cx| {
+                        this.input_device = device;
+                        this.pad_press(name, window, cx)
+                    });
+                    if ok.is_err() {
+                        return;
+                    }
                 }
             }
         }));
