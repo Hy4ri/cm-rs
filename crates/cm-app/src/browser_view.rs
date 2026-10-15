@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ac_core::bookmarks::{self, Bookmark};
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Bounds, Context, Corners, Element, ElementId, Entity, EventEmitter,
@@ -16,7 +17,6 @@ use gpui::{
     MouseUpEvent, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent,
     Style, Styled, Task, Window, div, px,
 };
-use ac_core::bookmarks::{self, Bookmark};
 use image::{Frame, ImageBuffer};
 
 use crate::browser_engine::BrowserEngine;
@@ -28,9 +28,8 @@ use crate::text_input::TextInput;
 use crate::theme;
 use crate::widgets::{button, chip, primary_button};
 
-/// Initial default home page for the mod browser.
-pub(crate) const DEFAULT_BROWSER_URL: &str =
-    "https://www.overtake.gg/downloads/categories/assetto-corsa.1/";
+/// A local start page, rendered by GPUI rather than a remote mod website.
+pub(crate) const DEFAULT_BROWSER_URL: &str = "about:blank";
 
 /// Refresh polling interval for frames and snapshot updates.
 const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(16);
@@ -79,7 +78,8 @@ impl Focusable for BrowserView {
 impl BrowserView {
     pub fn new_at(url: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        let address_input = cx.new(|cx| TextInput::new(cx, "Enter URL…", url.to_owned()));
+        let address = if url == DEFAULT_BROWSER_URL { "" } else { url };
+        let address_input = cx.new(|cx| TextInput::new(cx, "Enter URL…", address.to_owned()));
 
         let mut view = Self {
             focus_handle,
@@ -137,7 +137,11 @@ impl BrowserView {
             .map(|engine| engine.snapshot())
             .unwrap_or_else(|| self.snapshot.clone());
         Bookmark {
-            title: snapshot.title,
+            title: if snapshot.url == DEFAULT_BROWSER_URL {
+                "Bookmarks".to_owned()
+            } else {
+                snapshot.title
+            },
             url: snapshot.url,
         }
     }
@@ -249,7 +253,11 @@ impl BrowserView {
             || downloads_changed(&new_snapshot.downloads, &self.snapshot.downloads)
         {
             if new_snapshot.url != self.snapshot.url && !new_snapshot.url.is_empty() {
-                let url_copy = new_snapshot.url.clone();
+                let url_copy = if new_snapshot.url == DEFAULT_BROWSER_URL {
+                    String::new()
+                } else {
+                    new_snapshot.url.clone()
+                };
                 self.address_input.update(cx, |input, cx| {
                     input.set_text(url_copy, cx);
                 });
@@ -295,7 +303,9 @@ impl BrowserView {
     }
 
     fn persist_bookmarks(&mut self) {
-        self.bookmark_error = bookmarks::save(&self.bookmarks).err().map(|e| format!("{e:#}"));
+        self.bookmark_error = bookmarks::save(&self.bookmarks)
+            .err()
+            .map(|e| format!("{e:#}"));
     }
 
     /// Saves the current page, or removes it if it is already saved.
@@ -307,7 +317,11 @@ impl BrowserView {
         if let Some(i) = self.bookmarks.iter().position(|b| b.url == url) {
             self.bookmarks.remove(i);
         } else {
-            let title = if self.snapshot.title.trim().is_empty() { url.clone() } else { self.snapshot.title.trim().to_owned() };
+            let title = if self.snapshot.title.trim().is_empty() {
+                url.clone()
+            } else {
+                self.snapshot.title.trim().to_owned()
+            };
             self.bookmarks.push(Bookmark { title, url });
         }
         self.persist_bookmarks();
@@ -323,8 +337,11 @@ impl BrowserView {
     }
 
     fn open_bookmark(&mut self, i: usize, cx: &mut Context<Self>) {
-        let Some(url) = self.bookmarks.get(i).map(|b| b.url.clone()) else { return };
-        self.address_input.update(cx, |input, cx| input.set_text(url.clone(), cx));
+        let Some(url) = self.bookmarks.get(i).map(|b| b.url.clone()) else {
+            return;
+        };
+        self.address_input
+            .update(cx, |input, cx| input.set_text(url.clone(), cx));
         match &self.engine {
             Some(engine) => {
                 if let Err(err) = engine.navigate(&url) {
@@ -554,7 +571,11 @@ impl BrowserView {
 }
 
 impl Render for BrowserView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_home = self.snapshot.url.is_empty() || self.snapshot.url == DEFAULT_BROWSER_URL;
+        if is_home {
+            self.release_images(window);
+        }
         let is_loading = self.snapshot.loading;
         let can_back = self.snapshot.can_go_back;
         let can_fwd = self.snapshot.can_go_forward;
@@ -589,6 +610,13 @@ impl Render for BrowserView {
                 button("browser-reload", if is_loading { "✕" } else { "⟳" })
                     .on_click(cx.listener(|this, _, _, cx| this.reload_or_stop(cx))),
             )
+            .child(
+                button("browser-home", "Home").on_click(cx.listener(|this, _, _, cx| {
+                    this.address_input
+                        .update(cx, |input, cx| input.set_text(DEFAULT_BROWSER_URL, cx));
+                    this.submit_url(cx);
+                })),
+            )
             // Address bar
             .child(
                 div()
@@ -619,15 +647,18 @@ impl Render for BrowserView {
                 chip(
                     "browser-bookmarks",
                     format!("Bookmarks ({})", self.bookmarks.len()),
-                    self.show_bookmarks,
+                    self.show_bookmarks || is_home,
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.show_bookmarks = !this.show_bookmarks;
-                    cx.notify();
-                })),
+                .when(!is_home, |d| {
+                    d.on_click(cx.listener(|this, _, _, cx| {
+                        this.show_bookmarks = !this.show_bookmarks;
+                        cx.notify();
+                    }))
+                }),
             );
 
-        let bookmarks_panel = self.show_bookmarks.then(|| {
+        let bookmarks_panel = (self.show_bookmarks || is_home).then(|| {
+            let text_width = (f32::from(window.viewport_size().width) - 370.).clamp(80., 640.);
             let rows: Vec<AnyElement> = self
                 .bookmarks
                 .iter()
@@ -651,10 +682,33 @@ impl Render for BrowserView {
                                 .whitespace_nowrap()
                                 .text_ellipsis()
                                 .text_sm()
-                                .child(format!("{}  —  {}", b.title, b.url))
-                                .on_click(cx.listener(move |this, _, _, cx| this.open_bookmark(i, cx))),
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .when(is_home, |d| d.py_3())
+                                .child(
+                                    div()
+                                        .w(px(text_width))
+                                        .text_ellipsis()
+                                        .overflow_hidden()
+                                        .child(b.title.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(text_width))
+                                        .text_ellipsis()
+                                        .overflow_hidden()
+                                        .text_xs()
+                                        .text_color(theme::muted())
+                                        .child(b.url.clone()),
+                                )
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.open_bookmark(i, cx)),
+                                ),
                         )
-                        .child(button(("bm-del", i), "Remove").on_click(cx.listener(move |this, _, _, cx| this.remove_bookmark(i, cx))))
+                        .child(button(("bm-del", i), "Remove").on_click(
+                            cx.listener(move |this, _, _, cx| this.remove_bookmark(i, cx)),
+                        ))
                         .into_any_element()
                 })
                 .collect();
@@ -664,19 +718,56 @@ impl Render for BrowserView {
                 .flex_col()
                 .gap_1()
                 .p_2()
-                .max_h(px(200.))
+                .when(!is_home, |d| d.max_h(px(200.)))
+                .when(is_home, |d| d.flex_1().min_h_0().p_6())
                 .overflow_y_scroll()
                 .bg(theme::panel())
                 .border_b_1()
                 .border_color(theme::border())
                 .flex_shrink_0()
+                .when(is_home, |d| {
+                    d.child(
+                        div()
+                            .w_full()
+                            .max_w(px(760.))
+                            .mx_auto()
+                            .mb_4()
+                            .child(div().text_xl().child("Bookmarks"))
+                            .child(
+                                div()
+                                    .mt_2()
+                                    .text_sm()
+                                    .text_color(theme::muted())
+                                    .child("Your saved pages. Pick one to start browsing."),
+                            ),
+                    )
+                })
                 .when_some(self.bookmark_error.clone(), |d, e| {
                     d.child(div().text_sm().text_color(theme::error()).child(e))
                 })
                 .when(rows.is_empty(), |d| {
-                    d.child(div().text_sm().text_color(theme::muted()).child("No bookmarks yet. Press ☆ to save the current page."))
+                    d.child(
+                        div()
+                            .text_sm()
+                            .text_color(theme::muted())
+                            .w_full()
+                            .max_w(px(760.))
+                            .mx_auto()
+                            .child(
+                                "No bookmarks yet. Enter a URL above, then press ☆ to save a page.",
+                            ),
+                    )
                 })
-                .children(rows)
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(760.))
+                        .mx_auto()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .children(rows),
+                )
         });
 
         // Error banner if any snapshot error exists
@@ -882,7 +973,7 @@ impl Render for BrowserView {
             .child(nav_bar)
             .children(bookmarks_panel)
             .children(error_banner)
-            .child(viewport_element)
+            .when(!is_home, |d| d.child(viewport_element))
             .children(downloads_bar)
     }
 }
