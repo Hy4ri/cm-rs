@@ -23,8 +23,16 @@ pub fn path() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("cm-rs").join("bookmarks.toml"))
 }
 
-/// A missing file is an empty list. A file that doesn't parse is an error, so
-/// the caller never overwrites a hand-edited file with an empty one.
+/// Bookmarks shown until the user saves their own list.
+fn defaults() -> Vec<Bookmark> {
+    vec![Bookmark {
+        title: "AssettoWorld".to_owned(),
+        url: "https://www.assettoworld.com/".to_owned(),
+    }]
+}
+
+/// A missing file yields the default bookmarks. A file that doesn't parse is
+/// an error, so the caller never overwrites a hand-edited file with an empty one.
 pub fn load() -> Result<Vec<Bookmark>> {
     load_from(&path().context("no config directory")?)
 }
@@ -39,7 +47,7 @@ fn load_from(p: &Path) -> Result<Vec<Bookmark>> {
             let file: File = toml::from_str(&text).with_context(|| format!("reading {}", p.display()))?;
             Ok(file.bookmarks)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(defaults()),
         Err(e) => Err(e).with_context(|| format!("reading {}", p.display())),
     }
 }
