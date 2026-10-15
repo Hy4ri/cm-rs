@@ -4,6 +4,7 @@ mod browser_engine;
 mod browser_types;
 mod browser_view;
 mod cli;
+mod content_sort;
 mod events_view;
 mod text_input;
 mod theme;
