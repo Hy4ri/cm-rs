@@ -11,11 +11,12 @@ use ac_core::settings::Settings;
 use ac_core::{acd, install, launch, paths};
 use gpui::{
     ClickEvent, Context, Div, Entity, FocusHandle, FontWeight, KeyDownEvent, ModifiersChangedEvent,
-    ObjectFit, PathPromptOptions, ScrollStrategy, SharedString, UniformListScrollHandle, Window, div, img,
-    prelude::*, px, uniform_list,
+    ObjectFit, PathPromptOptions, ScrollStrategy, SharedString, UniformListScrollHandle, Window,
+    div, img, prelude::*, px, uniform_list,
 };
 
 use crate::browser_view::{BrowserView, PreviewDownload};
+use crate::content_sort::{CarSort, TrackSort};
 use crate::events_view::{EventsView, Running};
 use crate::text_input::TextInput;
 use crate::theme;
@@ -121,6 +122,12 @@ pub struct CmApp {
     pad_tracks: bool,
     car_brand: Option<String>,
     tracks_view: Vec<usize>,
+    car_sort: CarSort,
+    track_sort: TrackSort,
+    car_sort_desc: bool,
+    track_sort_desc: bool,
+    car_sort_open: bool,
+    track_sort_open: bool,
 
     mode: ModeKind,
     practice_minutes: u32,
@@ -345,6 +352,12 @@ impl CmApp {
             pad_tracks: false,
             car_brand: None,
             tracks_view: Vec::new(),
+            car_sort: CarSort::default(),
+            track_sort: TrackSort::default(),
+            car_sort_desc: false,
+            track_sort_desc: false,
+            car_sort_open: false,
+            track_sort_open: false,
             mode,
             practice_minutes,
             laps,
@@ -477,6 +490,20 @@ impl CmApp {
         self.tracks_view = (0..self.content.tracks.len())
             .filter(|&i| matches(&self.content.track_search[i], &track_q))
             .collect();
+        self.cars_view.sort_by(|&a, &b| {
+            self.car_sort.compare(
+                &self.content.cars[a],
+                &self.content.cars[b],
+                self.car_sort_desc,
+            )
+        });
+        self.tracks_view.sort_by(|&a, &b| {
+            self.track_sort.compare(
+                &self.content.tracks[a],
+                &self.content.tracks[b],
+                self.track_sort_desc,
+            )
+        });
         cx.notify();
     }
 
@@ -1667,6 +1694,109 @@ impl CmApp {
             .into_any_element()
     }
 
+    /// Compact independent sort pickers shared by the content pages and Quick Drive.
+    fn sort_header(&self, cars: bool, cx: &mut Context<Self>) -> Div {
+        let (label, open, descending, width) = if cars {
+            (
+                self.car_sort.label(),
+                self.car_sort_open,
+                self.car_sort_desc,
+                CAR_LIST_W,
+            )
+        } else {
+            (
+                self.track_sort.label(),
+                self.track_sort_open,
+                self.track_sort_desc,
+                TRACK_LIST_W,
+            )
+        };
+        let id = if cars { "car-sort" } else { "track-sort" };
+        let mut header =
+            div()
+                .flex()
+                .flex_col()
+                .flex_shrink_0()
+                .px_2()
+                .pt_2()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            button(
+                                id,
+                                format!("Sort: {label} {}", if open { "▴" } else { "▾" }),
+                            )
+                                .w(px(width - 96.))
+                                .truncate()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if cars {
+                                        this.car_sort_open = !this.car_sort_open;
+                                    } else {
+                                        this.track_sort_open = !this.track_sort_open;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            button((id, 0_usize), if descending { "↓ Desc" } else { "↑ Asc" })
+                                .flex_shrink_0()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if cars {
+                                        this.car_sort_desc = !this.car_sort_desc;
+                                    } else {
+                                        this.track_sort_desc = !this.track_sort_desc;
+                                    }
+                                    this.refilter(cx);
+                                    if cars {
+                                        this.car_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                    } else {
+                                        this.track_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                    }
+                                })),
+                        ),
+                );
+        if open {
+            let labels: Vec<_> = if cars {
+                CarSort::ALL.iter().map(|sort| sort.label()).collect()
+            } else {
+                TrackSort::ALL.iter().map(|sort| sort.label()).collect()
+            };
+            header = header.child(
+                div()
+                    .id((id, 1_usize))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .max_h(px(180.))
+                    .overflow_y_scroll()
+                    .children(labels.into_iter().enumerate().map(|(index, option)| {
+                        chip((id, index + 2), option, label == option).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                if cars {
+                                    this.car_sort = CarSort::ALL[index];
+                                    this.car_sort_open = false;
+                                } else {
+                                    this.track_sort = TrackSort::ALL[index];
+                                    this.track_sort_open = false;
+                                }
+                                this.refilter(cx);
+                                if cars {
+                                    this.car_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                } else {
+                                    this.track_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                }
+                            },
+                        ))
+                    })),
+            );
+        }
+        header
+    }
+
     fn car_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let counter = count_label(self.cars_view.len(), self.content.cars.len(), "cars");
         let list = uniform_list(
@@ -1704,8 +1834,19 @@ impl CmApp {
         )
         .track_scroll(self.car_scroll.clone())
         .flex_1();
-        let header = self.brand_header(cx);
-        self.list_column(CAR_LIST_W, self.car_filter.clone(), counter, Some(header), list)
+        let header = div()
+            .flex()
+            .flex_col()
+            .child(self.brand_header(cx))
+            .child(self.sort_header(true, cx))
+            .into_any_element();
+        self.list_column(
+            CAR_LIST_W,
+            self.car_filter.clone(),
+            counter,
+            Some(header),
+            list,
+        )
     }
 
     fn track_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1747,7 +1888,14 @@ impl CmApp {
         )
         .track_scroll(self.track_scroll.clone())
         .flex_1();
-        self.list_column(TRACK_LIST_W, self.track_filter.clone(), counter, None, list)
+        let header = self.sort_header(false, cx).into_any_element();
+        self.list_column(
+            TRACK_LIST_W,
+            self.track_filter.clone(),
+            counter,
+            Some(header),
+            list,
+        )
     }
 
     /// `−  value  +` control; pair it with [`setting_row`] for the label.
